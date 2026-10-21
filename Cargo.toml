@@ -1,6 +1,6 @@
 [package]
 name = "pdfflow"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2024"
 description = "A small PDF editor with a Photoshop-style UI"
 license = "MIT OR Apache-2.0"

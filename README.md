@@ -24,12 +24,12 @@ Katsushika Hokusai, c. 1831, public domain.</sub>
 
 ## Download
 
-**Version 0.1.1** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.1)):
+**Version 0.1.2** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.2)):
 
 | Platform | File |
 |---|---|
-| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.1-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.1/PDFflow-0.1.1-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.1/PDFflow-0.1.1-macOS-universal.zip) |
-| Windows 10 / 11, 64-bit | [PDFflow-0.1.1-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.1/PDFflow-0.1.1-windows-x64.zip) |
+| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.2-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-macOS-universal.zip) |
+| Windows 10 / 11, 64-bit | [PDFflow-0.1.2-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-windows-x64.zip) |
 
 The builds are not signed by Apple or Microsoft, so the first launch needs one extra step. On
 macOS, drag PDFflow to Applications, then right-click it and choose **Open** (or run
