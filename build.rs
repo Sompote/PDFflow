@@ -9,7 +9,7 @@ fn main() {
     res.set_icon("assets/icon.ico")
         .set("ProductName", "PDFflow")
         .set("FileDescription", "PDFflow PDF editor")
-        .set("LegalCopyright", "MIT OR Apache-2.0");
+        .set("LegalCopyright", "Copyright (C) 2026 Sompote. AGPL-3.0-or-later");
     // Cross-compiling from macOS or Linux uses the MinGW resource compiler.
     if !cfg!(windows) {
         res.set_windres_path("x86_64-w64-mingw32-windres").set_ar_path("x86_64-w64-mingw32-ar");

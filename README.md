@@ -246,7 +246,13 @@ Contrast, Equalize, Shadows/Highlights and `.cube` parsing.
 
 ## Licences
 
-Code: MIT OR Apache-2.0. The PDFflow logo and app icon are in `docs/logo.png`, `docs/logo-dark.png` and
-`assets/icon.png`. Theme tokens, widgets, the pen and picture tool icons and the image
-adjustment formulas are adapted from PhotoCraft (MIT OR Apache-2.0). Icons: Lucide (ISC). Fonts: Inter and Sarabun (SIL OFL 1.1, see
-`assets/fonts`).
+PDFflow is licensed under the GNU Affero General Public License, version 3 or (at your option)
+any later version (`AGPL-3.0-or-later`). You may use, change and share it, but if you distribute a
+modified version, or let people use one over a network, you must offer them its source code under
+the same licence. Releases up to and including 0.1.2 were published under MIT OR Apache-2.0 and
+remain available under those terms.
+
+The PDFflow logo and app icon are in `docs/logo.png`, `docs/logo-dark.png` and `assets/icon.png`.
+Theme tokens, widgets, the pen and picture tool icons and the image adjustment formulas are
+adapted from PhotoCraft (MIT OR Apache-2.0). Icons: Lucide (ISC). Fonts: Inter and Sarabun (SIL
+OFL 1.1, see `assets/fonts`).

@@ -31,6 +31,7 @@ for s in 16 32 128 256 512; do
     sips -z $d $d assets/icon.png --out "$ICONSET/icon_${s}x${s}@2x.png" >/dev/null
 done
 iconutil -c icns "$ICONSET" -o "$APP/Contents/Resources/AppIcon.icns"
+cp LICENSE "$APP/Contents/Resources/LICENSE"
 rm -rf "$ICONSET"
 
 cat > "$APP/Contents/Info.plist" <<PLIST
@@ -75,7 +76,7 @@ WIN="$DIST/PDFflow-$VER-windows-x64"
 mkdir -p "$WIN"
 cp target/x86_64-pc-windows-gnu/release/pdfflow.exe "$WIN/PDFflow.exe"
 cp README.md "$WIN/README.md"
-cp assets/fonts/OFL-Inter.txt assets/fonts/OFL-Sarabun.txt "$WIN/"
+cp LICENSE assets/fonts/OFL-Inter.txt assets/fonts/OFL-Sarabun.txt "$WIN/"
 (cd "$DIST" && zip -qr "PDFflow-$VER-windows-x64.zip" "PDFflow-$VER-windows-x64")
 rm -rf "$WIN"
 

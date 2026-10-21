@@ -3,7 +3,7 @@ name = "pdfflow"
 version = "0.1.2"
 edition = "2024"
 description = "A small PDF editor with a Photoshop-style UI"
-license = "MIT OR Apache-2.0"
+license = "AGPL-3.0-or-later"
 
 [dependencies]
 eframe = { version = "0.36", default-features = false, features = ["glow", "x11", "wayland"] }
