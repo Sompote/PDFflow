@@ -1,0 +1,29 @@
+[package]
+name = "pdfeditor"
+version = "0.1.0"
+edition = "2024"
+description = "A small PDF editor with a Photoshop-style UI"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+eframe = { version = "0.36", default-features = false, features = ["glow", "x11", "wayland"] }
+hayro = "0.7"
+lopdf = { version = "0.38", default-features = false }
+image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "bmp", "webp"] }
+rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "async-std"] }
+skrifa = "0.44"
+harfrust = "0.12"
+flate2 = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[dev-dependencies]
+egui_kittest = { version = "0.36", features = ["eframe"] }
