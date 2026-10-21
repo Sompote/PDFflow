@@ -135,7 +135,7 @@ cargo build --release
 
 ## Small and light
 
-The release binary is about 11 MB, and with a 13-page journal paper open at 150 % on a Retina
+The release binary is about 12.4 MB (the digital-signature crypto adds about 1.5 MB), and with a 13-page journal paper open at 150 % on a Retina
 display the app uses about 95 MB of memory. It runs egui on the glow (OpenGL) renderer with no web
 view and repaints only on input. Page textures are capped at 4096 px per side and 12 MP and are
 kept only for visible pages, and placed pictures keep a preview of at most 1024 px on screen while
