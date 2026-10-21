@@ -22,6 +22,9 @@ mod rtools;
 mod signui;
 #[path = "notes.rs"]
 mod notes;
+#[path = "adjui.rs"]
+mod adjui;
+use adjui::AdjustDialog;
 use pen::{Part, PenDraft};
 use rtools::{Live, PixSel, RasterOpts};
 use signui::{CreateDialog, ImportDialog, SignDialog, TrustDialog};
@@ -220,6 +223,7 @@ pub struct App {
     trusted: Vec<(PathBuf, x509_cert::Certificate)>,
     trust_dlg: Option<TrustDialog>,
     sign_placing: Option<SignDialog>,
+    adjust_dlg: Option<AdjustDialog>,
 }
 
 impl App {
@@ -298,6 +302,7 @@ impl App {
             trusted: crate::sig::load_trusted().into_iter().filter_map(|(p, b)| <x509_cert::Certificate as der::Decode>::from_der(&b).ok().map(|c| (p, c))).collect(),
             trust_dlg: None,
             sign_placing: None,
+            adjust_dlg: None,
         };
         #[cfg(target_os = "macos")]
         crate::macopen::set_context(&cc.egui_ctx);
@@ -327,6 +332,7 @@ impl App {
         self.grid = false;
         self.grid_drag = None;
         self.pen = None;
+        self.adjust_dlg = None;
         self.rlive = None;
         self.pix_sel = None;
         self.crop = None;
@@ -799,6 +805,7 @@ impl App {
                 self.sel = None;
             }
         }
+        self.adjust_shortcuts(ctx);
         if self.tool.is_raster() {
             if sc(Modifiers::COMMAND, Key::J) {
                 self.picture_from_selection();
@@ -1034,6 +1041,7 @@ impl App {
                     self.restack(false);
                 }
             });
+            ui.menu_button("Image", |ui| self.image_menu(ui));
             ui.menu_button("Page", |ui| {
                 let c = self.current;
                 if ui.button("Insert Blank Page After").clicked() {
@@ -1272,6 +1280,10 @@ impl App {
             }
             Kind::Image(img) => {
                 ui.label(egui::RichText::new(format!("{} × {} px", img.px[0], img.px[1])).color(t.text_dim));
+                if self.editing.is_none() {
+                    vline(ui, 22.0);
+                    self.adjust_button(ui);
+                }
                 false
             }
         };
@@ -2402,7 +2414,7 @@ impl eframe::App for App {
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let modal = self.trust_dlg.is_some() || self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some();
+        let modal = self.trust_dlg.is_some() || self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some() || self.adjusting();
         if self.pending.is_none() && self.sig_pad.is_none() && self.error.is_none() && !modal {
             self.shortcuts(&ctx);
         }
@@ -2430,6 +2442,7 @@ impl eframe::App for App {
             let rects = self.page_rects();
             self.note_popup(&ctx, &rects);
         }
+        self.adjust_window(&ctx);
         self.dialogs(&ctx);
         self.sign_dialogs(&ctx);
 
@@ -2535,6 +2548,13 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+        if self.frames == 6 {
+            if let Some(k) = std::env::var_os("PDFFLOW_SHOT_ADJUST") {
+                self.pix_sel = None;
+                self.set_tool(Tool::Move);
+                self.shot_adjustment(ctx, &k.to_string_lossy());
             }
         }
         if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_SIGNDLG").is_some() {

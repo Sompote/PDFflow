@@ -462,6 +462,64 @@ fn crop_eyedropper_and_new_picture_from_selection() {
     assert_eq!(pixel(&h, 0, 90, 50), [220, 20, 20, 255]);
 }
 
+#[test]
+fn invert_shortcut_and_desaturate_inside_a_selection() {
+    let mut h = with_picture();
+    h.key_press_modifiers(Modifiers::COMMAND, Key::I);
+    h.run_steps(2);
+    assert_eq!(pixel(&h, 0, 20, 20), [35, 235, 235, 255], "red half inverted");
+    assert_eq!(pixel(&h, 0, 150, 20), [235, 235, 35, 255], "blue half inverted");
+    undo(&mut h);
+    assert_eq!(pixel(&h, 0, 20, 20), [220, 20, 20, 255]);
+    // ⇧⌘U desaturates only inside a marquee selection (undo dropped the object selection).
+    h.state_mut().select(0, 0);
+    h.step();
+    h.key_press(Key::M);
+    h.step();
+    let (a, b) = (px_pt(&h, 0, 10.0, 10.0), px_pt(&h, 0, 50.0, 50.0));
+    assert!(h.state().tool == Tool::Marquee);
+    dragp(&mut h, a, b);
+    assert!(h.state().has_pixel_selection());
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::SHIFT, Key::U);
+    h.run_steps(2);
+    assert_eq!(pixel(&h, 0, 20, 20), [120, 120, 120, 255], "inside: grey");
+    assert_eq!(pixel(&h, 0, 80, 80), [220, 20, 20, 255], "outside: kept");
+}
+
+#[test]
+fn adjustment_dialog_previews_cancels_and_commits_one_undo_step() {
+    let mut h = with_picture();
+    let ctx = h.ctx.clone();
+    h.state_mut().start_adjust(&ctx, crate::adjust::AdjKind::HueSaturation);
+    h.run_steps(2);
+    assert!(h.state().adjusting());
+    *h.state_mut().adjust_settings_for_test().unwrap() = crate::adjust::Adj::HueSaturation { hue: 120.0, saturation: 0.0, lightness: 0.0, colorize: false };
+    h.run_steps(2);
+    let live = h.state().live_pixel_for_test(20, 20).unwrap();
+    assert!(live[1] > 150 && live[0] < 80, "preview turns red to green: {live:?}");
+    assert_eq!(pixel(&h, 0, 20, 20), [220, 20, 20, 255], "the document is unchanged while previewing");
+    // Escape cancels and puts the pixels back.
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(!h.state().adjusting());
+    assert_eq!(h.state().live_pixel_for_test(20, 20).unwrap(), [220, 20, 20, 255]);
+    let undo_depth = h.state().doc.can_undo();
+    // Enter commits.
+    h.state_mut().start_adjust(&ctx, crate::adjust::AdjKind::HueSaturation);
+    h.run_steps(1);
+    *h.state_mut().adjust_settings_for_test().unwrap() = crate::adjust::Adj::HueSaturation { hue: 120.0, saturation: 0.0, lightness: 0.0, colorize: false };
+    h.run_steps(1);
+    h.key_press(Key::Enter);
+    h.run_steps(2);
+    assert!(!h.state().adjusting());
+    let p = pixel(&h, 0, 20, 20);
+    assert!(p[1] > 150 && p[0] < 80, "committed: {p:?}");
+    assert_eq!(pixel(&h, 0, 150, 20)[0], 220, "blue turned red by +120°");
+    undo(&mut h);
+    assert_eq!(pixel(&h, 0, 20, 20), [220, 20, 20, 255]);
+    assert_eq!(h.state().doc.can_undo(), undo_depth);
+}
+
 fn test_id_file(dir: &std::path::Path) -> std::path::PathBuf {
     let p = dir.join("pdfflow-test-id.p12");
     if !p.exists() {

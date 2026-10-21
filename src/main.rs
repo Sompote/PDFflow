@@ -2,6 +2,7 @@
 
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
+mod adjust;
 mod app;
 mod doc;
 mod dsig;

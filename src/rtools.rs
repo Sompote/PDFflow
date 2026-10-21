@@ -119,7 +119,7 @@ impl App {
         }
     }
 
-    fn live_matches(&self, page: usize, idx: usize) -> bool {
+    pub(super) fn live_matches(&self, page: usize, idx: usize) -> bool {
         self.rlive.as_ref().is_some_and(|l| {
             l.page == page
                 && l.idx == idx
@@ -128,7 +128,7 @@ impl App {
     }
 
     /// Load the selected picture's pixels for editing (resampled to at most 2048 px).
-    fn ensure_live(&mut self, ctx: &egui::Context, page: usize, idx: usize) -> bool {
+    pub(super) fn ensure_live(&mut self, ctx: &egui::Context, page: usize, idx: usize) -> bool {
         if self.live_matches(page, idx) {
             return true;
         }
@@ -164,7 +164,7 @@ impl App {
     }
 
     /// Store the live pixels as a new version of the picture (one undo step).
-    fn commit_live(&mut self, before: Vec<PageEntry>) {
+    pub(super) fn commit_live(&mut self, before: Vec<PageEntry>) {
         let Some(l) = &mut self.rlive else { return };
         let Some(Obj { kind: Kind::Image(img), .. }) = self.doc.pages.get(l.page).and_then(|p| p.objects.get(l.idx)) else { return };
         let new = Arc::new(ImageData::edited(img.bytes.clone(), l.raster.clone()));
@@ -335,7 +335,7 @@ impl App {
         }
     }
 
-    fn sel_shape(&self) -> Option<SelShape> {
+    pub(super) fn sel_shape(&self) -> Option<SelShape> {
         let l = self.rlive.as_ref()?;
         self.pix_sel.as_ref().filter(|s| s.page == l.page && s.idx == l.idx).map(|s| s.shape.clone())
     }
@@ -744,5 +744,7 @@ impl App {
                 }
             }
         }
+        vline(ui, 22.0);
+        self.adjust_button(ui);
     }
 }

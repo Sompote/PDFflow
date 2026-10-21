@@ -9,8 +9,9 @@
 
 PDFflow is a small PDF editor written in Rust that you use the way you use Photoshop. You open a
 PDF, place text, pictures, drawings, Bézier paths and signatures on its pages as objects you can
-move and resize, retouch pictures with real pixel tools, and save a normal PDF that keeps the
-original content intact. The interface is ported from
+move and resize, retouch and colour-correct pictures with real pixel tools and Photoshop's
+Image › Adjustments, and save a normal PDF that keeps the original content intact. The interface
+is ported from
 [PhotoCraft](https://github.com/storytold/photocraft), so it has the same Pro Medium Gray / Pro
 Dark palettes, tab-strip panels, panel footers, Spectrum buttons and Lucide icons.
 
@@ -94,6 +95,34 @@ layers; otherwise they are dimmed and cannot be chosen.
 
 Size, hardness and opacity are in the options bar, and `[` and `]` change the brush size.
 
+### Picture adjustments
+
+![The Curves dialog open on a selected picture, with an S-curve over the picture's histogram and the contrast change previewed on the page](docs/adjustments.png)
+
+When a picture is selected, the **Image** menu and an **Adjustments…** button in the options bar
+offer Photoshop's Image › Adjustments with the same names, order and shortcuts. Each dialog
+previews its result live on the page, Cancel (Esc) puts the pixels back, and OK (Enter) applies
+the change as one undo step. With a Marquee or Lasso selection on the picture, an adjustment
+changes only the selected pixels, and Auto, Equalize and Match Color take their statistics from
+the selection alone.
+
+| Group | Adjustments |
+|---|---|
+| Tone | Brightness/Contrast (modern or legacy), Levels ⌘L (histogram, draggable input and output handles, Auto), Curves ⌘M (click to add a point, drag it off the graph to delete it), Exposure |
+| Colour | Vibrance, Hue/Saturation ⌘U (with Colorize), Color Balance ⌘B, Black & White ⌥⇧⌘B (with Tint), Photo Filter (Photoshop's 20 presets or any colour), Channel Mixer, Color Lookup (3D LUTs from `.cube` files) |
+| Effects | Invert ⌘I, Posterize, Threshold, Gradient Map, Selective Color (relative or absolute) |
+| Local tone | Shadows/Highlights, HDR Toning (Local Adaptation) |
+| Other | Desaturate ⇧⌘U, Match Color, Replace Color, Equalize |
+| Automatic | Auto Tone ⇧⌘L, Auto Contrast ⌥⇧⌘L, Auto Color ⇧⌘B (0.1 % clipping, as Photoshop) |
+
+The pixel formulas are ported from PhotoCraft, which measured them against Photoshop: modern
+Brightness/Contrast, Levels with Photoshop's whole-level rounding and midtone toe, Curves as a
+natural cubic spline, Color Balance folded into one Levels per channel, Vibrance in linear light,
+and Shadows/Highlights with an edge-aware neighbourhood and Beta-shaped tonal masks. Hue/Saturation
+edits only the Master range, Match Color works on the picture's own colours (there is no source
+image, so Neutralize removes a colour cast), and HDR Toning has no toning curve. Shadows/Highlights
+and HDR Toning are slow on large pictures, so their preview updates when a slider is released.
+
 ### Digital signatures
 
 PDFflow signs documents with a certificate, not only with a drawn signature. A Digital ID is a
@@ -174,6 +203,9 @@ x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 | M / Q / C / I | Marquee / Lasso / Crop / Eyedropper | G | Page Grid (Esc returns) |
 | J / N / Y / X | Healing / Brush / Clone / Eraser | ⌘J / ⌘A / ⌘D | New picture from selection / select all / deselect |
 | F / U / O | Gradient / Blur / Dodge | [ / ] | Brush size |
+| | | ⌘L / ⌘M / ⌘U / ⌘B | Levels / Curves / Hue/Saturation / Color Balance |
+| | | ⌘I / ⇧⌘U / ⌥⇧⌘B | Invert / Desaturate / Black & White |
+| | | ⇧⌘L / ⌥⇧⌘L / ⇧⌘B | Auto Tone / Auto Contrast / Auto Color |
 
 ## Small and light
 
@@ -196,20 +228,25 @@ when editing starts. The icons are Lucide SVGs flattened to polylines at build t
 
 ## Tests
 
-`cargo test` runs 37 tests. Round-trip tests save a document, render the saved file again with
+`cargo test` runs 47 tests. Round-trip tests save a document, render the saved file again with
 hayro and check pixels for every page rotation and crop box, embedded text, pictures, ink, filled
 paths, edited pixels and page reordering. Interaction tests drive the real window headlessly with
 egui_kittest: drawing, typing Thai, moving, resizing, undo, signatures, the Page Grid, every pen
-tool, the picture tools (selection, delete, brush, crop, eyedropper and ⌘J), and digital signatures
+tool, the picture tools (selection, delete, brush, crop, eyedropper and ⌘J), picture adjustments
+(⌘I with undo, Desaturate inside a marquee only, and a dialog's live preview, Cancel and OK as
+one undo step), and digital signatures
 (sign, tamper detection, countersigning on both cross-reference formats, wrong passwords, the
 save guard, the visible signature box landing on the selected object or a dragged box, a simulated
 university CA chain with a Thai-named certificate, and the drawn appearance), and comments (placed,
 typed in Thai, saved as Text annotations at the right place, read back, and replaced rather than
-duplicated on the next save).
+duplicated on the next save). Unit tests check that every adjustment leaves a picture unchanged at
+its default settings, that Hue/Saturation +40/+25/−10 turns (240, 160, 30) into Photoshop's
+(173, 243, 0) within two levels, and Levels, Curves, Brightness, Threshold, Posterize, Auto
+Contrast, Equalize, Shadows/Highlights and `.cube` parsing.
 
 ## Licences
 
 Code: MIT OR Apache-2.0. The PDFflow logo and app icon are in `docs/logo.png`, `docs/logo-dark.png` and
-`assets/icon.png`. Theme tokens, widgets and the pen and picture tool icons are adapted from
-PhotoCraft (MIT OR Apache-2.0). Icons: Lucide (ISC). Fonts: Inter and Sarabun (SIL OFL 1.1, see
+`assets/icon.png`. Theme tokens, widgets, the pen and picture tool icons and the image
+adjustment formulas are adapted from PhotoCraft (MIT OR Apache-2.0). Icons: Lucide (ISC). Fonts: Inter and Sarabun (SIL OFL 1.1, see
 `assets/fonts`).
