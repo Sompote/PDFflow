@@ -471,7 +471,19 @@ fn test_id_file(dir: &std::path::Path) -> std::path::PathBuf {
 }
 
 fn dialog(visible: bool) -> crate::app::signui_dialog::SignDialog {
-    crate::app::signui_dialog::SignDialog { id: 0, password: "secret".into(), reason: "Approved".into(), location: String::new(), visible, error: None }
+    crate::app::signui_dialog::SignDialog {
+        id: 0,
+        password: "secret".into(),
+        reason: "Approved".into(),
+        location: String::new(),
+        visible,
+        place: None,
+        image: crate::app::signui_dialog::ImageChoice::None,
+        show_name: true,
+        show_date: true,
+        show_reason: false,
+        error: None,
+    }
 }
 
 #[test]
@@ -496,7 +508,7 @@ fn signing_keeps_earlier_signatures_and_edits_are_guarded() {
     let (two, name) = h.state_mut().sign_document(&dialog(false)).unwrap();
     assert_eq!(name, "UI Tester");
     assert!(two.starts_with(&one), "the second signature is an incremental update");
-    let r = crate::dsig::verify(&two);
+    let r = crate::dsig::verify(&two, &[]);
     assert_eq!(r.len(), 2);
     assert!(r.iter().all(|s| s.valid()), "{r:?}");
     // Saving an unedited signed file is allowed; saving after an edit asks first.
@@ -531,7 +543,7 @@ fn visible_signature_box_lands_on_the_selected_object() {
     for k in 0..4 {
         assert!((rect[k] - want[k]).abs() < 0.5, "{rect:?} vs {want:?}");
     }
-    assert!(crate::dsig::verify(&signed)[0].valid());
+    assert!(crate::dsig::verify(&signed, &[])[0].valid());
 }
 
 fn comments_in(pdf: &[u8]) -> Vec<(String, String, Vec<f32>)> {
@@ -601,4 +613,24 @@ fn comments_are_saved_as_pdf_annotations_and_read_back() {
     let c = comments_in(&again);
     assert_eq!(c.len(), 1);
     assert_eq!(c[0].0, "Edited");
+}
+
+#[test]
+fn drag_a_box_to_place_the_signature() {
+    let dir = std::env::temp_dir().join("pdfflow-ui-sign3");
+    std::fs::create_dir_all(&dir).unwrap();
+    let idf = test_id_file(&dir);
+    let mut h = harness(None);
+    h.state_mut().add_test_id(idf);
+    h.state_mut().start_placing_for_test(dialog(false));
+    dragp(&mut h, pos2(300.0, 200.0), pos2(480.0, 260.0));
+    let d = h.state_mut().take_sign_dialog_for_test().expect("the dialog comes back with the box");
+    let (p, r) = d.place.unwrap();
+    assert_eq!(p, 0);
+    assert!((r.min - pos2(300.0, 200.0)).length() < 2.0 && (r.max - pos2(480.0, 260.0)).length() < 2.0, "{r:?}");
+    let (signed, _) = h.state_mut().sign_document(&d).unwrap();
+    let doc = lopdf::Document::load_mem(&signed).unwrap();
+    let widget = doc.objects.values().filter_map(|o| o.as_dict().ok()).find(|d| d.get(b"FT").and_then(|v| v.as_name()).ok() == Some(b"Sig".as_slice())).unwrap();
+    let rect: Vec<f32> = widget.get(b"Rect").unwrap().as_array().unwrap().iter().map(|v| v.as_float().unwrap()).collect();
+    assert!((rect[0] - r.min.x).abs() < 0.5 && (rect[3] - (842.0 - r.min.y)).abs() < 0.5, "{rect:?}");
 }

@@ -23,6 +23,8 @@ pub struct IdEntry {
     pub file: PathBuf,
     pub name: String,
     pub detail: String,
+    /// Certificate expiry, "YYYY-MM-DD" (empty if unknown).
+    pub expires: String,
 }
 
 fn ids_index() -> Option<PathBuf> {
@@ -35,9 +37,12 @@ pub fn load_ids() -> Vec<IdEntry> {
     let Ok(text) = std::fs::read_to_string(index) else { return Vec::new() };
     text.lines()
         .filter_map(|l| {
-            let mut it = l.splitn(3, '|');
+            let mut it = l.splitn(4, '|');
             let file = dir.join("ids").join(it.next()?);
-            file.exists().then(|| IdEntry { file, name: it.next().unwrap_or("").to_owned(), detail: it.next().unwrap_or("").to_owned() })
+            let name = it.next().unwrap_or("").to_owned();
+            let detail = it.next().unwrap_or("").to_owned();
+            let expires = it.next().unwrap_or("").to_owned();
+            file.exists().then_some(IdEntry { file, name, detail, expires })
         })
         .collect()
 }
@@ -46,7 +51,7 @@ pub fn save_ids(ids: &[IdEntry]) {
     let Some(index) = ids_index() else { return };
     let text: String = ids
         .iter()
-        .map(|e| format!("{}|{}|{}\n", e.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), e.name.replace('|', " "), e.detail.replace('|', " ")))
+        .map(|e| format!("{}|{}|{}|{}\n", e.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), e.name.replace('|', " "), e.detail.replace('|', " "), e.expires))
         .collect();
     let _ = std::fs::write(index, text);
 }
@@ -64,6 +69,24 @@ pub fn store_id_file(name: &str, p12: &[u8]) -> Result<PathBuf, String> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
     }
+    Ok(path)
+}
+
+/// Root certificates the user chose to trust (e.g. a university CA), as DER files.
+pub fn load_trusted() -> Vec<(PathBuf, Vec<u8>)> {
+    let Some(dir) = config_dir().map(|d| d.join("trusted")) else { return Vec::new() };
+    let Ok(rd) = std::fs::read_dir(dir) else { return Vec::new() };
+    let mut v: Vec<(PathBuf, Vec<u8>)> = rd.flatten().map(|e| e.path()).filter(|p| p.extension().is_some_and(|e| e == "der")).filter_map(|p| std::fs::read(&p).ok().map(|b| (p, b))).collect();
+    v.sort();
+    v
+}
+
+pub fn store_trusted(der: &[u8], name: &str) -> Result<PathBuf, String> {
+    let dir = config_dir().ok_or("No settings folder.")?.join("trusted");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem: String = name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).take(60).collect();
+    let path = dir.join(format!("{stem}.der"));
+    std::fs::write(&path, der).map_err(|e| e.to_string())?;
     Ok(path)
 }
 

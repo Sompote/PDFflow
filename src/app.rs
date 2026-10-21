@@ -24,7 +24,7 @@ mod signui;
 mod notes;
 use pen::{Part, PenDraft};
 use rtools::{Live, PixSel, RasterOpts};
-use signui::{CreateDialog, ImportDialog, SignDialog};
+use signui::{CreateDialog, ImportDialog, SignDialog, TrustDialog};
 use notes::NoteEdit;
 #[cfg(test)]
 pub(crate) fn notes_without_comments_for_test(b: &[u8]) -> Option<Vec<u8>> {
@@ -32,7 +32,7 @@ pub(crate) fn notes_without_comments_for_test(b: &[u8]) -> Option<Vec<u8>> {
 }
 #[cfg(test)]
 pub(crate) mod signui_dialog {
-    pub(crate) use super::signui::SignDialog;
+    pub(crate) use super::signui::{ImageChoice, SignDialog};
 }
 
 /// Space between pages and around the page column, in PDF points.
@@ -133,6 +133,7 @@ enum Drag {
     Draw { page: usize, pts: Vec<Pos2> },
     Create { page: usize, start: Pos2, cur: Pos2 },
     VScroll { grab: f32 },
+    SignBox { page: usize, start: Pos2, cur: Pos2 },
     PenPull { page: usize },
     Freeform { page: usize, pts: Vec<Pos2> },
     PathPoint { page: usize, idx: usize, node: usize, part: Part, symmetric: bool, before: Vec<PageEntry>, orig: Vec<crate::path::Node>, closed: bool, moved: bool },
@@ -216,6 +217,9 @@ pub struct App {
     note_edit: Option<NoteEdit>,
     author: String,
     note_color: Color32,
+    trusted: Vec<(PathBuf, x509_cert::Certificate)>,
+    trust_dlg: Option<TrustDialog>,
+    sign_placing: Option<SignDialog>,
 }
 
 impl App {
@@ -291,6 +295,9 @@ impl App {
             note_edit: None,
             author: notes::default_author(),
             note_color: notes::NOTE_COLORS[0],
+            trusted: crate::sig::load_trusted().into_iter().filter_map(|(p, b)| <x509_cert::Certificate as der::Decode>::from_der(&b).ok().map(|c| (p, c))).collect(),
+            trust_dlg: None,
+            sign_placing: None,
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -299,6 +306,10 @@ impl App {
     }
 
     // ----------------------------------------------------------------------------------- files
+
+    pub(crate) fn trusted_certs(&self) -> Vec<x509_cert::Certificate> {
+        self.trusted.iter().map(|(_, c)| c.clone()).collect()
+    }
 
     fn reset_view(&mut self) {
         self.page_tex.clear();
@@ -334,7 +345,7 @@ impl App {
             Ok(sizes) if !sizes.is_empty() => {
                 self.doc = Doc::from_pdf(Some(path), bytes.clone(), &sizes);
                 self.reset_view();
-                self.sig_reports = crate::dsig::verify(&bytes);
+                self.sig_reports = crate::dsig::verify(&bytes, &self.trusted_certs());
                 self.import_comments(&bytes);
                 self.status = format!("Opened {} ({} pages)", self.doc.title(), self.doc.pages.len());
             }
@@ -832,6 +843,10 @@ impl App {
                 self.current = self.current.saturating_sub(1);
                 self.scroll_thumbs_to = Some(self.current);
             }
+            return;
+        }
+        if self.sign_placing.is_some() && ctx.input(|i| i.key_pressed(Key::Escape)) {
+            self.sign_dlg = self.sign_placing.take();
             return;
         }
         if self.pen.is_some() {
@@ -1686,6 +1701,11 @@ impl App {
                     let o = Obj { rect: Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)), kind: Kind::Ink { strokes: Arc::new(vec![pts.clone()]), color, width, highlighter: hl } };
                     paint_obj(&painter, &self.doc.pages[*page], rects[*page].min, self.zoom, &o);
                 }
+                Drag::SignBox { page, start, cur } => {
+                    let sr = screen_rect(&self.doc.pages[*page], rects[*page].min, self.zoom, Rect::from_two_pos(*start, *cur));
+                    painter.rect_filled(sr, 2.0, t.accent.gamma_multiply(0.15));
+                    painter.rect_stroke(sr, 2.0, Stroke::new(1.5, t.accent), StrokeKind::Middle);
+                }
                 Drag::Freeform { page, pts } => {
                     let o = Obj { rect: Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)), kind: Kind::Ink { strokes: Arc::new(vec![pts.clone()]), color: self.opts.color, width: self.opts.width, highlighter: false } };
                     paint_obj(&painter, &self.doc.pages[*page], rects[*page].min, self.zoom, &o);
@@ -1697,6 +1717,19 @@ impl App {
                 }
                 _ => {}
             }
+        }
+
+        // The signature box chosen in the sign dialog.
+        if let Some((p, r)) = self.sign_dlg.as_ref().and_then(|d| d.place).or_else(|| self.sign_placing.as_ref().and_then(|d| d.place)) {
+            if p < rects.len() {
+                let sr = screen_rect(&self.doc.pages[p], rects[p].min, self.zoom, r);
+                painter.rect_filled(sr, 2.0, t.accent.gamma_multiply(0.12));
+                painter.extend(Shape::dashed_line(&[sr.left_top(), sr.right_top(), sr.right_bottom(), sr.left_bottom(), sr.left_top()], Stroke::new(1.5, t.accent), 6.0, 4.0));
+                painter.text(sr.left_top() + vec2(4.0, 3.0), egui::Align2::LEFT_TOP, "Digital signature", FontId::proportional(11.0), t.accent);
+            }
+        }
+        if self.sign_placing.is_some() {
+            ctx.set_cursor_icon(CursorIcon::Crosshair);
         }
 
         // Selection frame and handles.
@@ -1951,6 +1984,12 @@ impl App {
             }
             self.end_edit();
             let hit = self.page_at(rects, p);
+            if self.sign_placing.is_some() {
+                if let Some((pi, pp)) = hit {
+                    self.drag = Some(Drag::SignBox { page: pi, start: pp, cur: pp });
+                }
+                return;
+            }
             if let Some((pi, _)) = hit {
                 if pi != self.current {
                     self.current = pi;
@@ -2070,6 +2109,11 @@ impl App {
                     self.clamp_scroll();
                 }
                 Drag::VScroll { .. } => {}
+                Drag::SignBox { page, cur, .. } => {
+                    if let Some(pp) = pp_of(*page) {
+                        *cur = pp;
+                    }
+                }
                 Drag::PenPull { page } | Drag::Freeform { page, .. } | Drag::PathPoint { page, .. } => {
                     if let Some(pp) = pp_of(*page) {
                         self.pen_drag(pp);
@@ -2112,6 +2156,17 @@ impl App {
             let drag = self.drag.take().expect("drag");
             match drag {
                 Drag::Move { before, moved: true, .. } | Drag::Resize { before, .. } => self.doc.push_undo(before),
+                Drag::SignBox { page, start, cur } => {
+                    let size = self.doc.pages[page].size;
+                    let r = if (cur - start).length() * z < 6.0 { Rect::from_center_size(start, vec2(180.0, 60.0)) } else { Rect::from_two_pos(start, cur) };
+                    let r = Rect::from_min_size(r.min, r.size().max(vec2(40.0, 20.0))).intersect(Rect::from_min_size(Pos2::ZERO, size));
+                    if let Some(mut d) = self.sign_placing.take() {
+                        d.place = Some((page, r));
+                        d.error = None;
+                        self.sign_dlg = Some(d);
+                        self.status = "Signature box placed.".into();
+                    }
+                }
                 Drag::Move { page, idx, moved: false, .. } => {
                     if matches!(self.doc.pages.get(page).and_then(|p| p.objects.get(idx)).map(|o| &o.kind), Some(Kind::Note { .. })) {
                         self.open_note(page, idx);
@@ -2340,7 +2395,7 @@ impl eframe::App for App {
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        let modal = self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some();
+        let modal = self.trust_dlg.is_some() || self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some();
         if self.pending.is_none() && self.sig_pad.is_none() && self.error.is_none() && !modal {
             self.shortcuts(&ctx);
         }
@@ -2415,7 +2470,7 @@ impl App {
         self.sel = Some((page, idx));
     }
     pub(crate) fn add_test_id(&mut self, file: PathBuf) {
-        self.ids.push(crate::sig::IdEntry { file, name: "Test".into(), detail: String::new() });
+        self.ids.push(crate::sig::IdEntry { file, name: "Test".into(), detail: String::new(), expires: String::new() });
     }
     pub(crate) fn signature_reports(&self) -> &[crate::dsig::SigReport] {
         &self.sig_reports
@@ -2431,6 +2486,12 @@ impl App {
     }
     pub(crate) fn note_open(&self) -> bool {
         self.note_edit.is_some()
+    }
+    pub(crate) fn start_placing_for_test(&mut self, d: SignDialog) {
+        self.sign_placing = Some(d);
+    }
+    pub(crate) fn take_sign_dialog_for_test(&mut self) -> Option<SignDialog> {
+        self.sign_dlg.take()
     }
     pub(crate) fn rendered_counts(&self) -> (usize, usize) {
         (self.page_tex.len(), self.thumbs.len())
@@ -2467,6 +2528,15 @@ impl App {
                         }
                     }
                 }
+            }
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_SIGNDLG").is_some() {
+            if self.ids.is_empty() {
+                self.ids.push(crate::sig::IdEntry { file: PathBuf::from("/dev/null"), name: "สมโพธิ อยู่ไว".into(), detail: "Issued by Thai University Consortium Certification Authority".into(), expires: "2027-10-21".into() });
+            }
+            self.open_sign_dialog();
+            if let Some(d) = &mut self.sign_dlg {
+                d.place = Some((0, Rect::from_min_size(pos2(330.0, 600.0), vec2(200.0, 64.0))));
             }
         }
         if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_NOTE").is_some() {

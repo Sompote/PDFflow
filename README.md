@@ -99,9 +99,32 @@ Saving an unedited signed file writes it back byte for byte; saving after edits 
 because rewriting the content removes the signatures. Signatures made by PDFflow verify as valid
 in Poppler's `pdfsig`.
 
+The signature box can show a drawn signature, a saved signature or a picture file, with any of
+the signer's name, the date and the reason, laid out as Acrobat does and set in embedded Sarabun
+so Thai names display correctly. **Draw Box on Page…** in the sign dialog places it by dragging,
+as Acrobat's *Digitally Sign* does. Trusting a root certificate (the ✓ button in Digital IDs, for a
+`.crt` / `.cer`) makes signatures whose certificates chain to that root show as verified, with the
+chain listed in the signature panel. Each Digital ID shows its expiry date, and an expired ID is
+refused with a reminder to renew it.
+
+#### Using a KMUTT Digital ID
+
+KMUTT issues certificate files through `http://mysign.kmutt.ac.th` (see the Computer Center's
+*KMUTT Digital Document* manual), and PDFflow uses them the same way Acrobat Reader does:
+
+1. Download `CA.crt` (the *Thai University Consortium Certification Authority* root) and your
+   `<login>.p12`, choosing the PKCS#12 password on the site.
+2. In PDFflow, open **Digital IDs**, press ✓ and choose `CA.crt` to trust it, then press the folder
+   button, choose your `.p12` and enter its password.
+3. Open the document, select your drawn signature or use **Draw Box on Page…**, then
+   **File › Sign with Digital ID…**, enter the password and **Sign and Save As…** under a new name.
+   Others can sign the saved file in turn; every signature stays valid.
+4. The `.p12` is valid for about a year. When it expires, download a new one from mysign and
+   import it again.
+
 The verification is honest about its limits: it checks integrity and the cryptographic signature,
-but it does not build a certificate chain to trusted root certificates or check revocation, so it
-cannot vouch for who the signer is. Signatures carry no trusted timestamp (TSA) or long-term
+and the certificate chain up to the roots you trust, but it does not check revocation (CRL or
+OCSP), so a certificate revoked after signing still shows as trusted. Signatures carry no trusted timestamp (TSA) or long-term
 validation data, and PDF/A or certified (MDP) signatures are not produced.
 
 ### Saving
@@ -150,17 +173,18 @@ when editing starts. The icons are Lucide SVGs flattened to polylines at build t
 - Encrypted (password-protected) PDFs cannot be opened.
 - Text is set without automatic line wrapping (press Return for a new line).
 - Pictures larger than 2048 px are resampled to 2048 px when you first edit their pixels.
-- Signature verification checks integrity and the signature itself, not trust in the certificate.
+- Signature verification trusts only the roots you import and does not check revocation.
 
 ## Tests
 
-`cargo test` runs 35 tests. Round-trip tests save a document, render the saved file again with
+`cargo test` runs 37 tests. Round-trip tests save a document, render the saved file again with
 hayro and check pixels for every page rotation and crop box, embedded text, pictures, ink, filled
 paths, edited pixels and page reordering. Interaction tests drive the real window headlessly with
 egui_kittest: drawing, typing Thai, moving, resizing, undo, signatures, the Page Grid, every pen
 tool, the picture tools (selection, delete, brush, crop, eyedropper and ⌘J), and digital signatures
 (sign, tamper detection, countersigning on both cross-reference formats, wrong passwords, the
-save guard, and the visible signature box landing on the selected object), and comments (placed,
+save guard, the visible signature box landing on the selected object or a dragged box, a simulated
+university CA chain with a Thai-named certificate, and the drawn appearance), and comments (placed,
 typed in Thai, saved as Text annotations at the right place, read back, and replaced rather than
 duplicated on the next save).
 

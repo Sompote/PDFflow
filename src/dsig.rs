@@ -144,6 +144,19 @@ pub struct SignOptions {
     pub extra_rotation: u16,
     pub reason: String,
     pub location: String,
+    pub appearance: Appearance,
+}
+
+/// What the visible signature box shows, as in Acrobat's "Customize the Signature Appearance".
+#[derive(Clone, Default)]
+pub struct Appearance {
+    /// A drawn signature: strokes in a unit box, its width/height ratio, and the ink colour.
+    pub strokes: Option<(std::sync::Arc<Vec<Vec<eframe::egui::Pos2>>>, f32, [u8; 3])>,
+    /// A signature picture (PNG / JPEG file bytes).
+    pub picture: Option<std::sync::Arc<Vec<u8>>>,
+    pub show_name: bool,
+    pub show_date: bool,
+    pub show_reason: bool,
 }
 
 /// Sign `base` and return the signed file (the original bytes plus one incremental update).
@@ -156,12 +169,12 @@ pub fn sign_pdf(base: &[u8], id: &DigitalId, o: &SignOptions) -> Res<Vec<u8>> {
     let root_id = doc.trailer.get(b"Root").and_then(Object::as_reference).map_err(|e| e.to_string())?;
     let size = doc.trailer.get(b"Size").and_then(Object::as_i64).unwrap_or(0) as u32;
     let mut next = doc.max_id.max(size.saturating_sub(1)) + 1;
-    let mut new_id = || {
-        let id = (next, 0u16);
-        next += 1;
+    let take = |next: &mut u32| {
+        let id = (*next, 0u16);
+        *next += 1;
         id
     };
-    let (sig_id, widget_id, ap_id) = (new_id(), new_id(), new_id());
+    let (sig_id, widget_id, ap_id) = (take(&mut next), take(&mut next), take(&mut next));
     let mut objects: Vec<(ObjectId, Vec<u8>)> = Vec::new();
 
     // Widget rectangle in PDF user space.
@@ -199,31 +212,27 @@ pub fn sign_pdf(base: &[u8], id: &DigitalId, o: &SignOptions) -> Res<Vec<u8>> {
     sig.extend_from_slice(b" /Prop_Build << /App << /Name /PDFflow >> >> >>");
     objects.push((sig_id, sig));
 
-    // Appearance: a small label inside the visible box.
-    let (w, h) = (user_rect[2] - user_rect[0], user_rect[3] - user_rect[1]);
-    let mut ap = String::new();
-    if w > 1.0 && h > 1.0 {
-        let date = human_date(now);
-        let who = if id.name.is_ascii() { format!("Digitally signed by {}", id.name) } else { "Digitally signed".to_owned() };
-        let longest = who.len().max(date.len() + 6) as f32;
-        let fs = (w / (longest * 0.5)).min(h / 4.0).clamp(3.0, 9.0);
-        let _ = write!(
-            ap,
-            "q BT /Helv {fs:.2} Tf 0.15 0.25 0.55 rg 2 {:.2} Td ({}) Tj 0 {:.2} Td (Date: {}) Tj ET Q",
-            fs * 1.4,
-            pdf_escape(&who),
-            -fs * 1.2,
-            pdf_escape(&date)
-        );
+    // Appearance in the box's upright (display) orientation; /Matrix turns it with the page.
+    let (dw, dh) = o.rect.map(|r| (r[2] - r[0], r[3] - r[1])).unwrap_or((0.0, 0.0));
+    let m = page_matrix(&doc, page_id, o.extra_rotation);
+    let mut extra = Document::with_version("1.7");
+    extra.max_id = next - 1;
+    let (content, resources) = if dw > 1.0 && dh > 1.0 { appearance(&mut extra, id, o, now, dw, dh)? } else { (String::new(), String::new()) };
+    next = extra.max_id + 1;
+    for (oid, obj) in extra.objects.iter() {
+        objects.push((*oid, ser_object(obj)?));
     }
     let mut ap_obj = Vec::new();
     let _ = write!(
         ap_obj,
-        "<< /Type /XObject /Subtype /Form /BBox [0 0 {:.3} {:.3}] /Resources << /Font << /Helv << /Type /Font /Subtype /Type1 /BaseFont /Helvetica /Encoding /WinAnsiEncoding >> >> >> /Length {} >>\nstream\n{}\nendstream",
-        w.max(0.0),
-        h.max(0.0),
-        ap.len() + 0,
-        ap
+        "<< /Type /XObject /Subtype /Form /BBox [0 0 {:.3} {:.3}] /Matrix [{} {} {} {} 0 0] /Resources << {resources} >> /Length {} >>\nstream\n{content}\nendstream",
+        dw.max(0.0),
+        dh.max(0.0),
+        m[0],
+        m[1],
+        -m[2],
+        -m[3],
+        content.len()
     );
     objects.push((ap_id, ap_obj));
 
@@ -298,7 +307,7 @@ pub fn sign_pdf(base: &[u8], id: &DigitalId, o: &SignOptions) -> Res<Vec<u8>> {
             objects.push((root_id, ser(&Object::Dictionary(cat))?));
         }
         _ => {
-            let af_id = new_id();
+            let af_id = take(&mut next);
             let mut af = Dictionary::new();
             add_field(&mut af, &mut objects)?;
             objects.push((af_id, ser(&Object::Dictionary(af))?));
@@ -455,6 +464,110 @@ fn last_startxref(b: &[u8]) -> Option<usize> {
     let pos = tail.windows(9).rposition(|w| w == b"startxref")?;
     let rest = std::str::from_utf8(&tail[pos + 9..]).ok()?;
     rest.split_whitespace().next()?.parse().ok()
+}
+
+/// Content stream and resources for the visible signature: the signature image (drawn strokes
+/// or a picture) and the chosen text lines in embedded Sarabun, so Thai names show correctly.
+fn appearance(extra: &mut Document, id: &DigitalId, o: &SignOptions, now: SystemTime, w: f32, h: f32) -> Res<(String, String)> {
+    let a = &o.appearance;
+    let mut lines = Vec::new();
+    if a.show_name {
+        lines.push("Digitally signed by".to_owned());
+        lines.push(id.name.clone());
+    }
+    if a.show_date {
+        lines.push(format!("Date: {}", human_date(now)));
+    }
+    if a.show_reason && !o.reason.trim().is_empty() {
+        lines.push(format!("Reason: {}", o.reason.trim()));
+    }
+    let has_image = a.strokes.is_some() || a.picture.is_some();
+    let pad = (w.min(h) * 0.06).clamp(1.0, 4.0);
+    // Image and text side by side in a wide box, stacked in a tall one.
+    let (img_box, text_box) = match (has_image, lines.is_empty()) {
+        (true, true) => ([pad, pad, w - pad, h - pad], None),
+        (false, _) => ([0.0; 4], Some([pad, pad, w - pad, h - pad])),
+        (true, false) if w / h >= 1.6 => ([pad, pad, w * 0.48, h - pad], Some([w * 0.5, pad, w - pad, h - pad])),
+        (true, false) => ([pad, h * 0.42, w - pad, h - pad], Some([pad, pad, w - pad, h * 0.40])),
+    };
+    let mut c = String::new();
+    let mut res = String::new();
+    let fit = |aspect: f32, b: [f32; 4]| {
+        let (bw, bh) = (b[2] - b[0], b[3] - b[1]);
+        let (fw, fh) = if bw / bh > aspect { (bh * aspect, bh) } else { (bw, bw / aspect) };
+        [b[0] + (bw - fw) / 2.0, b[1] + (bh - fh) / 2.0, fw, fh]
+    };
+    if let Some((strokes, aspect, col)) = &a.strokes {
+        let [x, y, fw, fh] = fit(*aspect, img_box);
+        let _ = write!(c, "q {:.3} {:.3} {:.3} RG {:.2} w 1 J 1 j ", col[0] as f32 / 255.0, col[1] as f32 / 255.0, col[2] as f32 / 255.0, (fh / 28.0).clamp(0.6, 2.5));
+        for st in strokes.iter() {
+            for (i, p) in st.iter().enumerate() {
+                let _ = write!(c, "{:.2} {:.2} {} ", x + p.x * fw, y + (1.0 - p.y) * fh, if i == 0 { "m" } else { "l" });
+            }
+            if st.len() == 1 {
+                let _ = write!(c, "{:.2} {:.2} l ", x + st[0].x * fw, y + (1.0 - st[0].y) * fh);
+            }
+            c.push_str("S ");
+        }
+        c.push_str("Q\n");
+    } else if let Some(bytes) = &a.picture {
+        let (pw, ph) = image::ImageReader::new(std::io::Cursor::new(bytes.as_slice()))
+            .with_guessed_format()
+            .ok()
+            .and_then(|r| r.into_dimensions().ok())
+            .ok_or("The signature picture cannot be read.")?;
+        let img = crate::doc::ImageData::new(bytes.clone(), [pw, ph], None);
+        let xo = crate::export::image_xobject(extra, &img)?;
+        let [x, y, fw, fh] = fit(pw as f32 / ph as f32, img_box);
+        let _ = write!(c, "q {fw:.3} 0 0 {fh:.3} {x:.3} {y:.3} cm /SigImg Do Q\n");
+        let _ = write!(res, "/XObject << /SigImg {} 0 R >> ", xo.0);
+    }
+    if let Some(tb) = text_box {
+        let (bw, bh) = (tb[2] - tb[0], tb[3] - tb[1]);
+        // Size the text to fill the box: widest line across, all lines down.
+        let unit: Vec<crate::text::Layout> = lines.iter().map(|l| crate::text::layout(l, 1.0, false)).collect();
+        let widest = unit.iter().map(|l| l.width).fold(0.01, f32::max);
+        let lh1 = crate::text::face(false).line_height(1.0);
+        let fs = (bw / widest).min(bh / (lines.len() as f32 * lh1)).clamp(2.0, 14.0);
+        let lh = lh1 * fs;
+        let top = tb[1] + bh - (bh - lh * lines.len() as f32) / 2.0;
+        let mut glyphs = std::collections::BTreeMap::new();
+        let _ = write!(c, "BT /SigFont {fs:.3} Tf 0.12 0.2 0.45 rg\n");
+        for (i, line) in lines.iter().enumerate() {
+            let l = crate::text::layout(line, fs, false);
+            for g in &l.glyphs {
+                let _ = writeln!(c, "1 0 0 1 {:.2} {:.2} Tm <{:04X}> Tj", tb[0] + g.x, top - i as f32 * lh - g.y, g.gid);
+                glyphs.entry(g.gid).or_insert_with(|| g.text.clone());
+            }
+        }
+        c.push_str("ET\n");
+        let fid = extra.new_object_id();
+        crate::export::embed_font(extra, fid, false, &glyphs);
+        let _ = write!(res, "/Font << /SigFont {} 0 R >> ", fid.0);
+    }
+    Ok((c, res))
+}
+
+/// The display-to-user matrix of a page (as in the editor's export).
+fn page_matrix(doc: &Document, page_id: ObjectId, extra_rotation: u16) -> [f32; 6] {
+    let (b, rotate) = crate::export::page_frame(doc, page_id);
+    crate::export::display_matrix(b, (rotate + 360 - extra_rotation % 360) % 360)
+}
+
+/// Serialise an indirect object, streams included.
+fn ser_object(o: &Object) -> Res<Vec<u8>> {
+    match o {
+        Object::Stream(st) => {
+            let mut d = st.dict.clone();
+            d.set("Length", st.content.len() as i64);
+            let mut out = ser(&Object::Dictionary(d))?;
+            out.extend_from_slice(b"\nstream\n");
+            out.extend_from_slice(&st.content);
+            out.extend_from_slice(b"\nendstream");
+            Ok(out)
+        }
+        other => ser(other),
+    }
 }
 
 /// Map a display-space rectangle (top-left origin, y down) to PDF user space.
@@ -623,6 +736,11 @@ pub struct SigReport {
     pub whole_file: bool,
     pub self_signed: bool,
     pub cert_current: bool,
+    /// The signer's certificate chains to a root the user trusts.
+    pub trusted: bool,
+    /// Certificate names from the signer up to the trusted root (when trusted).
+    pub chain: Vec<String>,
+    pub expires: String,
     pub problem: Option<String>,
 }
 
@@ -633,7 +751,7 @@ impl SigReport {
 }
 
 /// Check every signature in a PDF.
-pub fn verify(bytes: &[u8]) -> Vec<SigReport> {
+pub fn verify(bytes: &[u8], trusted: &[Certificate]) -> Vec<SigReport> {
     let Ok(doc) = Document::load_mem(bytes) else { return Vec::new() };
     let mut field_names = std::collections::HashMap::new();
     for obj in doc.objects.values() {
@@ -663,9 +781,12 @@ pub fn verify(bytes: &[u8]) -> Vec<SigReport> {
             whole_file: false,
             self_signed: false,
             cert_current: false,
+            trusted: false,
+            chain: Vec::new(),
+            expires: String::new(),
             problem: None,
         };
-        if let Err(e) = check(bytes, d, &mut r) {
+        if let Err(e) = check(bytes, d, trusted, &mut r) {
             r.problem = Some(e);
         }
         out.push(r);
@@ -683,7 +804,7 @@ pub(crate) fn decode_text(b: &[u8]) -> String {
     }
 }
 
-fn check(bytes: &[u8], d: &Dictionary, r: &mut SigReport) -> Res<()> {
+fn check(bytes: &[u8], d: &Dictionary, trusted: &[Certificate], r: &mut SigReport) -> Res<()> {
     let br: Vec<usize> = d.get(b"ByteRange").and_then(Object::as_array).map_err(|e| e.to_string())?.iter().filter_map(|o| o.as_i64().ok()).map(|v| v as usize).collect();
     if br.len() != 4 || br[0] + br[1] > bytes.len() || br[2] + br[3] > bytes.len() {
         return Err("Malformed byte range.".into());
@@ -716,6 +837,16 @@ fn check(bytes: &[u8], d: &Dictionary, r: &mut SigReport) -> Res<()> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
     let v = &cert.tbs_certificate.validity;
     r.cert_current = v.not_before.to_unix_duration() <= now && now <= v.not_after.to_unix_duration();
+    r.expires = expiry_date(&cert);
+    let pool: Vec<Certificate> = sd
+        .certificates
+        .as_ref()
+        .map(|set| set.0.iter().filter_map(|c| if let CertificateChoices::Certificate(c) = c { Some(c.clone()) } else { None }).collect())
+        .unwrap_or_default();
+    if let Some(chain) = chain_to_trust(&cert, &pool, trusted) {
+        r.trusted = true;
+        r.chain = chain;
+    }
 
     let digest_oid = si.digest_alg.oid.to_string();
     let mut data = Vec::with_capacity(br[1] + br[3]);
@@ -760,6 +891,75 @@ fn check(bytes: &[u8], d: &Dictionary, r: &mut SigReport) -> Res<()> {
     Ok(())
 }
 
+/// Read a certificate from a .crt / .cer file (DER or PEM).
+pub fn parse_cert_file(bytes: &[u8]) -> Res<Certificate> {
+    use der::DecodePem;
+    Certificate::from_der(bytes).or_else(|_| Certificate::from_pem(bytes)).map_err(|_| "Not an X.509 certificate (.crt / .cer).".to_owned())
+}
+
+/// The certificate's expiry date, "YYYY-MM-DD".
+pub fn expiry_date(cert: &Certificate) -> String {
+    let t = UNIX_EPOCH + cert.tbs_certificate.validity.not_after.to_unix_duration();
+    let (y, m, d, ..) = civil(t);
+    format!("{y:04}-{m:02}-{d:02}")
+}
+
+/// Seconds until the certificate expires (negative when expired).
+pub fn seconds_left(cert: &Certificate) -> i64 {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs() as i64;
+    cert.tbs_certificate.validity.not_after.to_unix_duration().as_secs() as i64 - now
+}
+
+/// Does `issuer`'s key verify the signature on `cert`?
+fn signed_by(cert: &Certificate, issuer: &Certificate) -> bool {
+    use rsa::signature::Verifier;
+    if cert.tbs_certificate.issuer != issuer.tbs_certificate.subject {
+        return false;
+    }
+    let Ok(tbs) = cert.tbs_certificate.to_der() else { return false };
+    let sig = cert.signature.raw_bytes();
+    let spki = &issuer.tbs_certificate.subject_public_key_info;
+    match cert.signature_algorithm.oid.to_string().as_str() {
+        alg @ ("1.2.840.113549.1.1.11" | "1.2.840.113549.1.1.12" | "1.2.840.113549.1.1.13" | "1.2.840.113549.1.1.5") => {
+            let Ok(pk) = rsa::RsaPublicKey::try_from(spki.owned_to_ref()) else { return false };
+            let Ok(s) = rsa::pkcs1v15::Signature::try_from(sig) else { return false };
+            match alg {
+                "1.2.840.113549.1.1.11" => rsa::pkcs1v15::VerifyingKey::<Sha256>::new(pk).verify(&tbs, &s).is_ok(),
+                "1.2.840.113549.1.1.12" => rsa::pkcs1v15::VerifyingKey::<sha2::Sha384>::new(pk).verify(&tbs, &s).is_ok(),
+                "1.2.840.113549.1.1.13" => rsa::pkcs1v15::VerifyingKey::<sha2::Sha512>::new(pk).verify(&tbs, &s).is_ok(),
+                _ => false, // SHA-1 certificate signatures are not accepted
+            }
+        }
+        "1.2.840.10045.4.3.2" => {
+            use p256::ecdsa::signature::Verifier as _;
+            let Ok(vk) = p256::ecdsa::VerifyingKey::from_sec1_bytes(spki.subject_public_key.raw_bytes()) else { return false };
+            let Ok(s) = p256::ecdsa::DerSignature::try_from(sig) else { return false };
+            vk.verify(&tbs, &s).is_ok()
+        }
+        _ => false,
+    }
+}
+
+/// Follow issuers from `leaf` through `pool` (certificates shipped in the signature) until a
+/// trusted certificate signs one; returns the names along the chain.
+pub fn chain_to_trust(leaf: &Certificate, pool: &[Certificate], trusted: &[Certificate]) -> Option<Vec<String>> {
+    let mut chain = vec![common_name(leaf)];
+    if trusted.iter().any(|t| t == leaf) {
+        return Some(chain);
+    }
+    let mut cur = leaf.clone();
+    for _ in 0..8 {
+        if let Some(root) = trusted.iter().find(|t| signed_by(&cur, t)) {
+            chain.push(common_name(root));
+            return Some(chain);
+        }
+        let next = pool.iter().find(|c| **c != cur && signed_by(&cur, c))?.clone();
+        chain.push(common_name(&next));
+        cur = next;
+    }
+    None
+}
+
 pub fn common_name_of(dn: &str) -> String {
     name_part(dn, "CN")
 }
@@ -802,7 +1002,7 @@ mod tests {
     }
 
     fn opts(rect: Option<[f32; 4]>) -> SignOptions {
-        SignOptions { page: 0, rect, extra_rotation: 0, reason: "Approved".into(), location: "Bangkok".into() }
+        SignOptions { page: 0, rect, extra_rotation: 0, reason: "Approved".into(), location: "Bangkok".into(), appearance: Appearance { show_name: true, show_date: true, ..Default::default() } }
     }
 
     #[test]
@@ -813,7 +1013,7 @@ mod tests {
         let base = crate::export::save(&Doc::new_blank()).unwrap();
         let signed = sign_pdf(&base, &id, &opts(Some([100.0, 100.0, 260.0, 160.0]))).unwrap();
         assert!(signed.starts_with(&base), "incremental: the original bytes are untouched");
-        let r = verify(&signed);
+        let r = verify(&signed, &[]);
         assert_eq!(r.len(), 1);
         assert!(r[0].valid() && r[0].whole_file && r[0].self_signed && r[0].cert_current, "{:?}", r[0]);
         assert_eq!(r[0].signer, "Test Signer");
@@ -826,12 +1026,12 @@ mod tests {
         let mut bad = signed.clone();
         let i = base.len() / 2;
         bad[i] = bad[i].wrapping_add(1);
-        let r = verify(&bad);
+        let r = verify(&bad, &[]);
         assert!(!r[0].intact, "tampering is detected");
 
         // A second signature is appended; the first stays valid but no longer covers the file.
         let twice = sign_pdf(&signed, &id, &opts(None)).unwrap();
-        let r = verify(&twice);
+        let r = verify(&twice, &[]);
         assert_eq!(r.len(), 2, "{r:?}");
         assert_eq!(r.iter().filter(|s| s.valid()).count(), 2, "{r:?}");
         assert_eq!(r.iter().filter(|s| s.whole_file).count(), 1);
@@ -841,12 +1041,75 @@ mod tests {
         std::fs::write(std::env::temp_dir().join("pdfflow-signed-twice.pdf"), &twice).unwrap();
     }
 
+    /// A university-style setup: a root CA, and a personal certificate it issued (Thai name),
+    /// packed as PKCS#12 without the root, as a CA's download portal would hand it out.
+    pub(crate) fn university_id(cn: &str) -> (Certificate, Vec<u8>) {
+        use rsa::pkcs8::EncodePrivateKey;
+        use std::str::FromStr;
+        use x509_cert::builder::{Builder, CertificateBuilder, Profile};
+        let mut rng = rand_core::OsRng;
+        let ca_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let ca_signer = rsa::pkcs1v15::SigningKey::<Sha256>::new(ca_key.clone());
+        let ca_name = x509_cert::name::Name::from_str("CN=Test University Consortium Certification Authority,O=Test Universities").unwrap();
+        let validity = x509_cert::time::Validity::from_now(Duration::from_secs(10 * 365 * 86_400)).unwrap();
+        let ca_spki = spki::SubjectPublicKeyInfoOwned::from_key(ca_key.to_public_key()).unwrap();
+        let ca = CertificateBuilder::new(Profile::Root, x509_cert::serial_number::SerialNumber::from(1u32), validity.clone(), ca_name.clone(), ca_spki, &ca_signer)
+            .unwrap()
+            .build::<rsa::pkcs1v15::Signature>()
+            .unwrap();
+        let key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let subject = x509_cert::name::Name::from_str(&format!("CN={cn},O=Test University")).unwrap();
+        let spki = spki::SubjectPublicKeyInfoOwned::from_key(key.to_public_key()).unwrap();
+        let profile = Profile::Leaf { issuer: ca_name, enable_key_agreement: false, enable_key_encipherment: false };
+        let leaf = CertificateBuilder::new(profile, x509_cert::serial_number::SerialNumber::from(42u32), validity, subject, spki, &ca_signer)
+            .unwrap()
+            .build::<rsa::pkcs1v15::Signature>()
+            .unwrap();
+        let mut ks = p12_keystore::KeyStore::new();
+        let entry = p12_keystore::PrivateKeyChain::new(key.to_pkcs8_der().unwrap().as_bytes(), [1u8; 20], [p12_keystore::Certificate::from_der(&leaf.to_der().unwrap()).unwrap()]);
+        ks.add_entry("me", p12_keystore::KeyStoreEntry::PrivateKeyChain(entry));
+        (ca, ks.writer("pw").write().unwrap())
+    }
+
+    #[test]
+    fn university_certificate_chain_and_thai_appearance() {
+        let (root, p12) = university_id("สมชาย ใจดี");
+        let id = load_p12(&p12, "pw").unwrap();
+        assert_eq!(id.name, "สมชาย ใจดี");
+        let base = crate::export::save(&Doc::new_blank()).unwrap();
+        let strokes = std::sync::Arc::new(vec![vec![eframe::egui::pos2(0.0, 0.8), eframe::egui::pos2(0.5, 0.1), eframe::egui::pos2(1.0, 0.8)]]);
+        let mut o = opts(Some([100.0, 100.0, 340.0, 180.0]));
+        o.appearance = Appearance { strokes: Some((strokes, 3.0, [20, 50, 140])), picture: None, show_name: true, show_date: true, show_reason: true };
+        let signed = sign_pdf(&base, &id, &o).unwrap();
+        // Without the root the signature is intact but the identity is unverified; trusting the
+        // root (as importing KMUTT's CA.crt does) makes the chain verified.
+        let r = verify(&signed, &[]);
+        assert!(r[0].valid() && !r[0].trusted, "{r:?}");
+        let r = verify(&signed, std::slice::from_ref(&root));
+        assert!(r[0].trusted, "{r:?}");
+        assert_eq!(r[0].chain, ["สมชาย ใจดี", "Test University Consortium Certification Authority"]);
+        // A root that did not issue the certificate is not accepted.
+        let (other_root, _) = university_id("x");
+        assert!(!verify(&signed, &[other_root])[0].trusted);
+        // The visible box is drawn: render the page and look for ink inside it.
+        let pdf = hayro::hayro_syntax::Pdf::new(std::sync::Arc::new(signed.clone())).unwrap();
+        let pix = hayro::render(&pdf.pages()[0], &hayro::RenderCache::new(), &Default::default(), &hayro::RenderSettings { x_scale: 1.0, y_scale: 1.0, bg_color: hayro::vello_cpu::color::palette::css::WHITE, ..Default::default() });
+        let data = pix.data_as_u8_slice();
+        let w = pix.width() as usize;
+        let ink = (100..180).flat_map(|y| (100..340).map(move |x| (x, y))).filter(|(x, y)| data[(y * w + x) * 4] < 150).count();
+        assert!(ink > 200, "signature appearance not drawn ({ink} dark pixels)");
+        // The Thai name is embedded in Sarabun with a ToUnicode map.
+        let doc = Document::load_mem(&signed).unwrap();
+        assert!(doc.objects.values().any(|o| o.as_dict().ok().and_then(|d| d.get(b"BaseFont").ok()).and_then(|b| b.as_name().ok()) == Some(b"Sarabun-Regular".as_slice())));
+        std::fs::write(std::env::temp_dir().join("pdfflow-signed-thai.pdf"), &signed).unwrap();
+    }
+
     #[test]
     fn signs_a_classic_xref_file() {
         let id = id();
         let base = crate::tests::source_pdf(90);
         let signed = sign_pdf(&base, &id, &opts(Some([20.0, 20.0, 200.0, 80.0]))).unwrap();
-        let r = verify(&signed);
+        let r = verify(&signed, &[]);
         assert!(r.len() == 1 && r[0].valid() && r[0].whole_file, "{r:?}");
         std::fs::write(std::env::temp_dir().join("pdfflow-signed-classic.pdf"), &signed).unwrap();
     }

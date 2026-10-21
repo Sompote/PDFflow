@@ -283,60 +283,68 @@ impl Writer {
 
     fn write_fonts(&self, pdf: &mut Document) {
         for fi in 0..2 {
-            let Some(id) = self.font_ids[fi] else { continue };
-            let face = text::face(fi == 1);
-            let k = 1000.0 / face.upem;
-            let file = {
-                let mut st = flate_stream(Dictionary::new(), face.data);
-                st.dict.set("Length1", face.data.len() as i64);
-                pdf.add_object(st)
-            };
-            let bb = face.bbox;
-            let desc = pdf.add_object(dictionary! {
-                "Type" => "FontDescriptor",
-                "FontName" => Object::Name(face.name.as_bytes().to_vec()),
-                "Flags" => 32,
-                "FontBBox" => vec![(bb[0] * k).into(), (bb[1] * k).into(), (bb[2] * k).into(), (bb[3] * k).into()],
-                "ItalicAngle" => 0,
-                "Ascent" => face.ascent * k,
-                "Descent" => face.descent * k,
-                "CapHeight" => face.ascent * k * 0.7,
-                "StemV" => if fi == 1 { 140 } else { 80 },
-                "FontFile2" => file,
-            });
-            let mut widths = Vec::new();
-            for gid in self.glyphs[fi].keys() {
-                widths.push(Object::Integer(*gid as i64));
-                widths.push(Object::Array(vec![Object::Real(face.advance(*gid) * k)]));
+            if let Some(id) = self.font_ids[fi] {
+                embed_font(pdf, id, fi == 1, &self.glyphs[fi]);
             }
-            let cid = pdf.add_object(dictionary! {
-                "Type" => "Font",
-                "Subtype" => "CIDFontType2",
-                "BaseFont" => Object::Name(face.name.as_bytes().to_vec()),
-                "CIDSystemInfo" => dictionary! {
-                    "Registry" => Object::String(b"Adobe".to_vec(), StringFormat::Literal),
-                    "Ordering" => Object::String(b"Identity".to_vec(), StringFormat::Literal),
-                    "Supplement" => 0,
-                },
-                "FontDescriptor" => desc,
-                "DW" => 1000,
-                "W" => widths,
-                "CIDToGIDMap" => "Identity",
-            });
-            let cmap = pdf.add_object(flate_stream(Dictionary::new(), to_unicode(&self.glyphs[fi]).as_bytes()));
-            pdf.objects.insert(
-                id,
-                Object::Dictionary(dictionary! {
-                    "Type" => "Font",
-                    "Subtype" => "Type0",
-                    "BaseFont" => Object::Name(face.name.as_bytes().to_vec()),
-                    "Encoding" => "Identity-H",
-                    "DescendantFonts" => vec![Object::Reference(cid)],
-                    "ToUnicode" => cmap,
-                }),
-            );
         }
     }
+
+}
+
+/// Embed Sarabun (regular or bold) as a Type0 font at `id`, with widths and a ToUnicode map for
+/// the glyphs used.
+pub(crate) fn embed_font(pdf: &mut Document, id: ObjectId, bold: bool, glyphs: &BTreeMap<u16, String>) {
+    let face = text::face(bold);
+    let k = 1000.0 / face.upem;
+    let file = {
+        let mut st = flate_stream(Dictionary::new(), face.data);
+        st.dict.set("Length1", face.data.len() as i64);
+        pdf.add_object(st)
+    };
+    let bb = face.bbox;
+    let desc = pdf.add_object(dictionary! {
+        "Type" => "FontDescriptor",
+        "FontName" => Object::Name(face.name.as_bytes().to_vec()),
+        "Flags" => 32,
+        "FontBBox" => vec![(bb[0] * k).into(), (bb[1] * k).into(), (bb[2] * k).into(), (bb[3] * k).into()],
+        "ItalicAngle" => 0,
+        "Ascent" => face.ascent * k,
+        "Descent" => face.descent * k,
+        "CapHeight" => face.ascent * k * 0.7,
+        "StemV" => if bold { 140 } else { 80 },
+        "FontFile2" => file,
+    });
+    let mut widths = Vec::new();
+    for gid in glyphs.keys() {
+        widths.push(Object::Integer(*gid as i64));
+        widths.push(Object::Array(vec![Object::Real(face.advance(*gid) * k)]));
+    }
+    let cid = pdf.add_object(dictionary! {
+        "Type" => "Font",
+        "Subtype" => "CIDFontType2",
+        "BaseFont" => Object::Name(face.name.as_bytes().to_vec()),
+        "CIDSystemInfo" => dictionary! {
+            "Registry" => Object::String(b"Adobe".to_vec(), StringFormat::Literal),
+            "Ordering" => Object::String(b"Identity".to_vec(), StringFormat::Literal),
+            "Supplement" => 0,
+        },
+        "FontDescriptor" => desc,
+        "DW" => 1000,
+        "W" => widths,
+        "CIDToGIDMap" => "Identity",
+    });
+    let cmap = pdf.add_object(flate_stream(Dictionary::new(), to_unicode(&glyphs).as_bytes()));
+    pdf.objects.insert(
+        id,
+        Object::Dictionary(dictionary! {
+            "Type" => "Font",
+            "Subtype" => "Type0",
+            "BaseFont" => Object::Name(face.name.as_bytes().to_vec()),
+            "Encoding" => "Identity-H",
+            "DescendantFonts" => vec![Object::Reference(cid)],
+            "ToUnicode" => cmap,
+        }),
+    );
 }
 
 /// Display space (top-left origin, y down, the page's /Rotate applied) to PDF user space, as a
@@ -429,7 +437,7 @@ fn to_unicode(map: &BTreeMap<u16, String>) -> String {
     s
 }
 
-fn image_xobject(pdf: &mut Document, img: &ImageData) -> Res<ObjectId> {
+pub(crate) fn image_xobject(pdf: &mut Document, img: &ImageData) -> Res<ObjectId> {
     let [w, h] = img.px;
     let original = img.raster.is_none();
     if let (true, Some(comps @ (1 | 3))) = (original, jpeg_components(&img.bytes)) {

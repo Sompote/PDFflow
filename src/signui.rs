@@ -10,7 +10,34 @@ pub(crate) struct SignDialog {
     pub reason: String,
     pub location: String,
     pub visible: bool,
+    /// A box drawn on a page for the signature (page, rect in page points).
+    pub place: Option<(usize, Rect)>,
+    pub image: ImageChoice,
+    pub show_name: bool,
+    pub show_date: bool,
+    pub show_reason: bool,
     pub error: Option<String>,
+}
+
+/// What picture the visible signature shows.
+#[derive(Clone, PartialEq)]
+pub(crate) enum ImageChoice {
+    None,
+    /// The selected drawn signature or picture (it moves into the signature box).
+    Selected,
+    /// A saved drawn signature from the Signatures tab.
+    Saved(usize),
+    /// A picture file of a handwritten signature.
+    Picture(Arc<Vec<u8>>, String),
+}
+
+/// A trusted root being confirmed before it is added.
+pub(super) struct TrustDialog {
+    pub der: Vec<u8>,
+    pub subject: String,
+    pub issuer: String,
+    pub expires: String,
+    pub fingerprint: String,
 }
 
 #[derive(Default)]
@@ -55,12 +82,25 @@ impl App {
             return;
         }
         let visible = self.selected().is_some();
+        let sel_is_image = self.selected().is_some_and(|o| matches!(o.kind, Kind::Ink { highlighter: false, .. } | Kind::Image(_)));
+        let image = if sel_is_image {
+            ImageChoice::Selected
+        } else if !self.sigs.is_empty() {
+            ImageChoice::Saved(self.sig_sel.min(self.sigs.len() - 1))
+        } else {
+            ImageChoice::None
+        };
         self.sign_dlg = Some(SignDialog {
             id: self.id_sel.min(self.ids.len() - 1),
             password: String::new(),
             reason: "I approve this document".into(),
             location: String::new(),
             visible,
+            place: None,
+            image,
+            show_name: true,
+            show_date: true,
+            show_reason: false,
             error: None,
         });
     }
@@ -70,19 +110,79 @@ impl App {
         let entry = self.ids.get(d.id).ok_or("Choose a Digital ID.")?;
         let p12 = std::fs::read(&entry.file).map_err(|e| e.to_string())?;
         let id = dsig::load_p12(&p12, &d.password)?;
-        // Untouched documents are signed on their original bytes, which keeps earlier signatures.
-        let base = match (&self.doc.source, self.doc.is_pristine()) {
-            (Some(src), true) => src.as_ref().clone(),
-            _ => export::save(&self.doc)?,
-        };
-        let (page, rect, extra) = match (d.visible, self.sel) {
-            (true, Some((p, i))) => {
+        if let Some(cert) = id.chain.first() {
+            if dsig::seconds_left(cert) < 0 {
+                return Err(format!(
+                    "This Digital ID expired on {}. Download a new one from your certificate authority (for KMUTT: mysign.kmutt.ac.th) and import it.",
+                    dsig::expiry_date(cert)
+                ));
+            }
+        }
+        // Where the signature box goes: a drawn box, else the selected object, else invisible.
+        let selected = self.sel.filter(|_| d.visible);
+        let (page, rect, extra) = match (d.place, selected) {
+            (Some((p, r)), _) => (p, Some([r.min.x, r.min.y, r.max.x, r.max.y]), self.doc.pages[p].rotation),
+            (None, Some((p, i))) => {
                 let r = self.doc.pages[p].objects[i].rect;
                 (p, Some([r.min.x, r.min.y, r.max.x, r.max.y]), self.doc.pages[p].rotation)
             }
             _ => (self.current.min(self.doc.pages.len() - 1), None, 0),
         };
-        let opts = dsig::SignOptions { page, rect, extra_rotation: extra, reason: d.reason.clone(), location: d.location.clone() };
+        let mut appearance = dsig::Appearance { show_name: d.show_name, show_date: d.show_date, show_reason: d.show_reason, ..Default::default() };
+        // The selected signature drawing or picture moves into the signature box, so it is not
+        // also painted on the page.
+        let mut lifted = None;
+        match &d.image {
+            ImageChoice::Selected => {
+                if let Some((p, i)) = self.sel {
+                    let o = &self.doc.pages[p].objects[i];
+                    match &o.kind {
+                        Kind::Ink { strokes, color, highlighter: false, .. } => {
+                            appearance.strokes = Some((strokes.clone(), o.rect.width() / o.rect.height().max(1e-3), [color.r(), color.g(), color.b()]));
+                            lifted = Some((p, i));
+                        }
+                        Kind::Image(img) => {
+                            appearance.picture = Some(match &img.raster {
+                                None => img.bytes.clone(),
+                                Some(r) => {
+                                    let mut png = Vec::new();
+                                    image::RgbaImage::from_raw(r.w, r.h, r.to_rgba())
+                                        .ok_or("bad picture")?
+                                        .write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png)
+                                        .map_err(|e| e.to_string())?;
+                                    Arc::new(png)
+                                }
+                            });
+                            lifted = Some((p, i));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            ImageChoice::Saved(i) => {
+                if let Some(sg) = self.sigs.get(*i) {
+                    let c = self.opts.sig_color;
+                    appearance.strokes = Some((sg.strokes.clone(), sg.aspect, [c.r(), c.g(), c.b()]));
+                }
+            }
+            ImageChoice::Picture(bytes, _) => appearance.picture = Some(bytes.clone()),
+            ImageChoice::None => {}
+        }
+        if rect.is_none() {
+            lifted = None;
+        }
+        // Untouched documents are signed on their original bytes, which keeps earlier signatures.
+        let base = match (&self.doc.source, self.doc.is_pristine(), lifted) {
+            (Some(src), true, None) => src.as_ref().clone(),
+            (_, _, Some((p, i))) => {
+                let o = self.doc.pages[p].objects.remove(i);
+                let r = export::save(&self.doc);
+                self.doc.pages[p].objects.insert(i, o);
+                r?
+            }
+            _ => export::save(&self.doc)?,
+        };
+        let opts = dsig::SignOptions { page, rect, extra_rotation: extra, reason: d.reason.clone(), location: d.location.clone(), appearance };
         Ok((dsig::sign_pdf(&base, &id, &opts)?, id.name))
     }
 
@@ -115,9 +215,10 @@ impl App {
             return Err("The passwords do not match.".into());
         }
         let p12 = dsig::create_self_signed(d.name.trim(), d.org.trim(), d.email.trim(), &d.pw)?;
+        let expires = dsig::load_p12(&p12, &d.pw).ok().and_then(|i| i.chain.first().map(dsig::expiry_date)).unwrap_or_default();
         let file = crate::sig::store_id_file(d.name.trim(), &p12)?;
         let detail = [d.org.trim(), d.email.trim()].iter().filter(|s| !s.is_empty()).cloned().collect::<Vec<_>>().join(" · ");
-        self.ids.push(IdEntry { file, name: d.name.trim().to_owned(), detail: format!("Self-signed · {detail}").trim_end_matches(" · ").to_owned() });
+        self.ids.push(IdEntry { file, name: d.name.trim().to_owned(), detail: format!("Self-signed · {detail}").trim_end_matches(" · ").to_owned(), expires });
         self.id_sel = self.ids.len() - 1;
         crate::sig::save_ids(&self.ids);
         self.status = "Digital ID created. Keep its password safe: it cannot be recovered.".into();
@@ -130,11 +231,44 @@ impl App {
         let issuer = dsig::common_name_of(&cert.tbs_certificate.issuer.to_string());
         let file = crate::sig::store_id_file(&id.name, &d.bytes)?;
         let detail = if cert.tbs_certificate.issuer == cert.tbs_certificate.subject { "Self-signed".to_owned() } else { format!("Issued by {issuer}") };
-        self.ids.push(IdEntry { file, name: id.name.clone(), detail });
+        self.ids.push(IdEntry { file, name: id.name.clone(), detail, expires: dsig::expiry_date(cert) });
         self.id_sel = self.ids.len() - 1;
         crate::sig::save_ids(&self.ids);
         self.status = format!("Imported the Digital ID of {} from {}.", id.name, d.path.display());
         Ok(())
+    }
+
+    /// Pick a root certificate (.crt / .cer) to trust, e.g. KMUTT's CA.crt from mysign.
+    pub(super) fn pick_trust_root(&mut self) {
+        let Some(path) = rfd::FileDialog::new().add_filter("Certificate", &["crt", "cer", "pem", "der"]).pick_file() else { return };
+        let bytes = match std::fs::read(&path) {
+            Ok(b) => b,
+            Err(e) => return self.error = Some(e.to_string()),
+        };
+        match dsig::parse_cert_file(&bytes) {
+            Ok(cert) => {
+                use der::Encode;
+                let der = cert.to_der().unwrap_or_default();
+                let fp: String = <sha2::Sha256 as sha2::Digest>::digest(&der).iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().chunks(2).map(|c| c.concat()).collect::<Vec<_>>().join(" ");
+                self.trust_dlg = Some(TrustDialog {
+                    subject: dsig::common_name(&cert),
+                    issuer: dsig::common_name_of(&cert.tbs_certificate.issuer.to_string()),
+                    expires: dsig::expiry_date(&cert),
+                    fingerprint: fp,
+                    der,
+                });
+            }
+            Err(e) => self.error = Some(e),
+        }
+    }
+
+    /// Re-check the open document's signatures (after the trusted roots change).
+    pub(super) fn reverify(&mut self) {
+        if let Some(src) = &self.doc.source {
+            if !self.sig_reports.is_empty() {
+                self.sig_reports = dsig::verify(src, &self.trusted_certs());
+            }
+        }
     }
 
     pub(super) fn pick_import_id(&mut self) {
@@ -185,7 +319,13 @@ impl App {
                 }
                 icons::paint(ui.painter(), Rect::from_center_size(pos2(row.left() + 14.0, row.center().y), vec2(16.0, 16.0)), "signature", t.icon);
                 ui.painter().text(pos2(row.left() + 30.0, row.top() + 11.0), egui::Align2::LEFT_CENTER, &e.name, FontId::proportional(12.5), t.text);
-                ui.painter().text(pos2(row.left() + 30.0, row.top() + 27.0), egui::Align2::LEFT_CENTER, &e.detail, FontId::proportional(10.5), t.text_faint);
+                let expired = !e.expires.is_empty() && e.expires.as_str() < today().as_str();
+                let detail = match (e.expires.is_empty(), expired) {
+                    (true, _) => e.detail.clone(),
+                    (false, false) => format!("{} · until {}", e.detail, e.expires),
+                    (false, true) => format!("Expired {} · renew it", e.expires),
+                };
+                ui.painter().text(pos2(row.left() + 30.0, row.top() + 27.0), egui::Align2::LEFT_CENTER, detail, FontId::proportional(10.5), if expired { t.danger } else { t.text_faint });
                 if resp.clicked() {
                     self.id_sel = i;
                 }
@@ -196,11 +336,34 @@ impl App {
                     }
                 });
             }
+            ui.add_space(8.0);
+            ui.label(egui::RichText::new("Trusted root certificates").color(t.text_dim));
+            if self.trusted.is_empty() {
+                ui.label(egui::RichText::new("None. Trust your certificate authority's root (✓ below) so its signatures show as verified.").color(t.text_faint).size(11.0));
+            }
+            let mut untrust = None;
+            for (k, (path, cert)) in self.trusted.iter().enumerate() {
+                let r = ui.label(egui::RichText::new(format!("✓ {} · until {}", dsig::common_name(cert), dsig::expiry_date(cert))).size(11.5));
+                r.context_menu(|ui| {
+                    if ui.button("Stop trusting").clicked() {
+                        untrust = Some((k, path.clone()));
+                        ui.close();
+                    }
+                });
+            }
+            if let Some((k, path)) = untrust {
+                let _ = std::fs::remove_file(path);
+                self.trusted.remove(k);
+                self.reverify();
+            }
         });
         if let Some(i) = remove {
             self.delete_id = Some(i);
         }
         widgets::panel_footer(ui, |ui| {
+            if icons::small(ui, "check", "Trust a root certificate (.crt / .cer), e.g. your university's CA").clicked() {
+                self.pick_trust_root();
+            }
             if icons::small(ui, "trash", "Delete the selected Digital ID").clicked() && !self.ids.is_empty() {
                 self.delete_id = Some(self.id_sel.min(self.ids.len() - 1));
             }
@@ -230,7 +393,10 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let ok = self.sig_reports.iter().all(SigReport::valid);
         let later = self.sig_reports.iter().all(|r| !r.whole_file);
-        let (fill, icon, text) = if !ok {
+        let trusted = self.sig_reports.iter().all(|r| r.trusted);
+        let (fill, icon, text) = if ok && !trusted && !later {
+            (Color32::from_rgb(110, 90, 30), "check", "Signatures are intact, but a signer's identity is not verified (the certificate does not chain to a trusted root).".to_owned())
+        } else if !ok {
             (Color32::from_rgb(120, 52, 40), "x", "At least one signature is invalid: the document was altered after signing, or the signature is damaged.".to_owned())
         } else if later {
             (Color32::from_rgb(110, 90, 30), "check", "Signatures are valid, but changes were added after the last signature.".to_owned())
@@ -262,6 +428,8 @@ impl App {
         if let Some(mut d) = self.sign_dlg.take() {
             let mut close = false;
             let mut go = false;
+            let mut draw_box = false;
+            let mut pick_picture = false;
             let can_visible = self.selected().is_some();
             egui::Modal::new(Id::new("sign-dlg")).show(ctx, |ui| {
                 ui.set_width(440.0);
@@ -278,13 +446,60 @@ impl App {
                 field(ui, "Password", &mut d.password, true);
                 field(ui, "Reason", &mut d.reason, false);
                 field(ui, "Location", &mut d.location, false);
-                ui.add_space(6.0);
-                ui.add_enabled_ui(can_visible, |ui| {
-                    widgets::checkbox(ui, &mut d.visible, "Show the signature on the selected object")
-                        .on_disabled_hover_text("Select your drawn signature (or any object) first to make the signature visible there.");
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Place"));
+                    let where_ = match (d.place, can_visible && d.visible) {
+                        (Some((p, _)), _) => format!("Box on page {}", p + 1),
+                        (None, true) => "On the selected object".to_owned(),
+                        _ => "Invisible (listed in the signature panel)".to_owned(),
+                    };
+                    ui.label(where_);
                 });
-                if !can_visible {
-                    ui.label(egui::RichText::new("Nothing is selected, so the signature will be invisible (listed in the signature panel).").color(t.text_faint));
+                ui.horizontal(|ui| {
+                    ui.add_space(116.0);
+                    if widgets::secondary_button(ui, "Draw Box on Page…", 0.0).clicked() {
+                        draw_box = true;
+                    }
+                    if d.place.is_some() && widgets::secondary_button(ui, "Remove Box", 0.0).clicked() {
+                        d.place = None;
+                    }
+                    if d.place.is_none() && can_visible {
+                        widgets::checkbox(ui, &mut d.visible, "Use selection");
+                    }
+                });
+                ui.add_space(6.0);
+                ui.horizontal(|ui| {
+                    ui.add_sized([110.0, 20.0], egui::Label::new("Signature image"));
+                    let label = |c: &ImageChoice| match c {
+                        ImageChoice::None => "None (text only)".to_owned(),
+                        ImageChoice::Selected => "The selected drawing / picture".to_owned(),
+                        ImageChoice::Saved(i) => format!("Saved signature {}", i + 1),
+                        ImageChoice::Picture(_, n) => n.clone(),
+                    };
+                    egui::ComboBox::from_id_salt("sig-img").width(260.0).selected_text(label(&d.image)).show_ui(ui, |ui| {
+                        ui.selectable_value(&mut d.image, ImageChoice::None, label(&ImageChoice::None));
+                        if can_visible {
+                            ui.selectable_value(&mut d.image, ImageChoice::Selected, label(&ImageChoice::Selected));
+                        }
+                        for i in 0..self.sigs.len() {
+                            ui.selectable_value(&mut d.image, ImageChoice::Saved(i), label(&ImageChoice::Saved(i)));
+                        }
+                        if ui.button("Picture file…").clicked() {
+                            pick_picture = true;
+                        }
+                    });
+                });
+                ui.horizontal(|ui| {
+                    ui.add_space(116.0);
+                    widgets::checkbox(ui, &mut d.show_name, "Name");
+                    widgets::checkbox(ui, &mut d.show_date, "Date");
+                    widgets::checkbox(ui, &mut d.show_reason, "Reason");
+                });
+                if let Some(e) = self.ids.get(d.id).filter(|e| !e.expires.is_empty()) {
+                    let expired = e.expires.as_str() < today().as_str();
+                    let c = if expired { t.danger } else { t.text_faint };
+                    ui.label(egui::RichText::new(if expired { format!("This Digital ID expired on {}; renew it (KMUTT: mysign.kmutt.ac.th).", e.expires) } else { format!("Digital ID valid until {}.", e.expires) }).color(c));
                 }
                 if !self.doc.is_pristine() && !self.sig_reports.is_empty() {
                     ui.label(egui::RichText::new("This PDF has been edited, so its existing signatures will not survive. Sign the unedited file to keep them.").color(t.danger));
@@ -302,6 +517,18 @@ impl App {
                     });
                 });
             });
+            if pick_picture {
+                if let Some(p) = rfd::FileDialog::new().add_filter("Picture", &["png", "jpg", "jpeg"]).pick_file() {
+                    if let Ok(b) = std::fs::read(&p) {
+                        d.image = ImageChoice::Picture(Arc::new(b), p.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default());
+                    }
+                }
+            }
+            if draw_box {
+                self.status = "Drag a box where the signature should appear (Esc cancels).".into();
+                self.sign_placing = Some(d);
+                return;
+            }
             if go || ctx.input(|i| i.key_pressed(Key::Enter)) {
                 d.visible &= can_visible;
                 match self.do_sign(&d) {
@@ -447,6 +674,47 @@ impl App {
             }
         }
 
+        if let Some(td) = &self.trust_dlg {
+            let mut choice = None;
+            egui::Modal::new(Id::new("trust")).show(ctx, |ui| {
+                ui.set_width(460.0);
+                ui.heading("Trust this root certificate?");
+                ui.add_space(6.0);
+                ui.label(format!("Name: {}", td.subject));
+                ui.label(format!("Issued by: {}", td.issuer));
+                ui.label(format!("Valid until: {}", td.expires));
+                ui.label(egui::RichText::new(format!("SHA-256: {}", td.fingerprint)).monospace().size(10.5));
+                ui.add_space(6.0);
+                ui.label(egui::RichText::new("Signatures whose certificates chain to this root will be shown as verified. Only trust a certificate you got from its owner (for KMUTT: CA.crt from mysign.kmutt.ac.th).").color(t.text_faint));
+                ui.add_space(12.0);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if widgets::primary_button(ui, "Trust", 80.0).clicked() {
+                        choice = Some(true);
+                    }
+                    if widgets::secondary_button(ui, "Cancel", 80.0).clicked() {
+                        choice = Some(false);
+                    }
+                });
+            });
+            match choice {
+                Some(true) => {
+                    let td = self.trust_dlg.take().expect("trust dialog");
+                    match crate::sig::store_trusted(&td.der, &td.subject) {
+                        Ok(path) => {
+                            if let Ok(c) = <x509_cert::Certificate as der::Decode>::from_der(&td.der) {
+                                self.trusted.push((path, c));
+                            }
+                            self.reverify();
+                            self.status = format!("Now trusting {}.", td.subject);
+                        }
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                Some(false) => self.trust_dlg = None,
+                None => {}
+            }
+        }
+
         if self.sig_panel {
             let mut open = true;
             egui::Window::new("Signature Panel").open(&mut open).default_width(520.0).collapsible(false).pivot(egui::Align2::CENTER_CENTER).default_pos(ctx.content_rect().center()).show(ctx, |ui| {
@@ -477,12 +745,16 @@ impl App {
                             );
                         }
                         ui.label(egui::RichText::new(format!("    Signed {}{}", r.when, if r.reason.is_empty() { String::new() } else { format!(" · Reason: {}", r.reason) })).color(t.text_faint));
-                        let identity = if r.self_signed {
-                            "Self-signed certificate: the signer's identity cannot be confirmed by a certificate authority.".to_owned()
+                        if r.trusted {
+                            line(ui, true, &format!("Trusted certificate chain: {}.", r.chain.join(" → ")));
+                        } else if r.self_signed {
+                            line(ui, false, "Self-signed certificate: the signer's identity cannot be confirmed.");
                         } else {
-                            format!("Issued by {}. Not checked against trusted root certificates.", r.issuer)
-                        };
-                        ui.label(egui::RichText::new(format!("    {identity}")).color(t.text_faint));
+                            line(ui, false, &format!("Identity not verified: issued by {}, which is not a trusted root here. Trust its root certificate in Digital IDs (for KMUTT: CA.crt from mysign.kmutt.ac.th).", r.issuer));
+                        }
+                        if !r.expires.is_empty() {
+                            ui.label(egui::RichText::new(format!("    Certificate valid until {}", r.expires)).color(t.text_faint));
+                        }
                         if !r.cert_current {
                             ui.label(egui::RichText::new("    The certificate is outside its validity period today.").color(t.danger));
                         }
@@ -493,4 +765,11 @@ impl App {
             self.sig_panel = open;
         }
     }
+}
+
+/// Today's date, "YYYY-MM-DD" (UTC), for comparing with certificate expiry dates.
+fn today() -> String {
+    let d = dsig::pdf_date(std::time::SystemTime::now());
+    let d = d.trim_start_matches("(D:");
+    format!("{}-{}-{}", &d[0..4], &d[4..6], &d[6..8])
 }

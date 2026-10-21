@@ -16,7 +16,7 @@ harfrust = "0.12"
 flate2 = "1"
 # Digital signatures (pure Rust, one RustCrypto generation: der 0.7)
 cms = { version = "0.2", features = ["builder"] }
-x509-cert = { version = "0.2", features = ["builder"] }
+x509-cert = { version = "0.2", features = ["builder", "pem"] }
 p12-keystore = "0.2"
 rsa = { version = "0.9", features = ["sha2"] }
 p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
