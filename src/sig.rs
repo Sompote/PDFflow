@@ -12,6 +12,61 @@ pub struct Signature {
     pub strokes: Arc<Vec<Vec<Pos2>>>,
 }
 
+/// The app's settings folder (signatures, Digital IDs).
+pub fn config_dir() -> Option<PathBuf> {
+    store_path().and_then(|p| p.parent().map(|d| d.to_path_buf()))
+}
+
+/// A Digital ID kept in the settings folder: its PKCS#12 file and the name shown in lists.
+#[derive(Clone)]
+pub struct IdEntry {
+    pub file: PathBuf,
+    pub name: String,
+    pub detail: String,
+}
+
+fn ids_index() -> Option<PathBuf> {
+    config_dir().map(|d| d.join("ids").join("index.txt"))
+}
+
+/// Saved Digital IDs (`ids/index.txt`: `file|name|detail` per line).
+pub fn load_ids() -> Vec<IdEntry> {
+    let (Some(index), Some(dir)) = (ids_index(), config_dir()) else { return Vec::new() };
+    let Ok(text) = std::fs::read_to_string(index) else { return Vec::new() };
+    text.lines()
+        .filter_map(|l| {
+            let mut it = l.splitn(3, '|');
+            let file = dir.join("ids").join(it.next()?);
+            file.exists().then(|| IdEntry { file, name: it.next().unwrap_or("").to_owned(), detail: it.next().unwrap_or("").to_owned() })
+        })
+        .collect()
+}
+
+pub fn save_ids(ids: &[IdEntry]) {
+    let Some(index) = ids_index() else { return };
+    let text: String = ids
+        .iter()
+        .map(|e| format!("{}|{}|{}\n", e.file.file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default(), e.name.replace('|', " "), e.detail.replace('|', " ")))
+        .collect();
+    let _ = std::fs::write(index, text);
+}
+
+/// Store a PKCS#12 file in the settings folder and return its path.
+pub fn store_id_file(name: &str, p12: &[u8]) -> Result<PathBuf, String> {
+    let dir = config_dir().ok_or("No settings folder.")?.join("ids");
+    std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
+    let stem: String = name.chars().map(|c| if c.is_alphanumeric() { c } else { '_' }).collect();
+    let stamp = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0);
+    let path = dir.join(format!("{stem}-{stamp}.p12"));
+    std::fs::write(&path, p12).map_err(|e| e.to_string())?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Ok(path)
+}
+
 fn store_path() -> Option<PathBuf> {
     let base = if cfg!(target_os = "macos") {
         std::env::var_os("HOME").map(|h| PathBuf::from(h).join("Library/Application Support/PDFEditor"))

@@ -38,6 +38,18 @@ pub fn button(ui: &mut Ui, name: &str, on: bool, tip: &str) -> Response {
     resp.on_hover_text(tip)
 }
 
+/// A tool button that can be disabled (dimmed, no click), as PhotoCraft does for tools that
+/// need a raster layer.
+pub fn button_state(ui: &mut Ui, name: &str, on: bool, enabled: bool, tip: &str) -> Response {
+    if enabled {
+        return button(ui, name, on, tip);
+    }
+    let t = Tokens::get(ui.ctx());
+    let (rect, resp) = ui.allocate_exact_size(egui::vec2(30.0, 28.0), Sense::hover());
+    paint(ui.painter(), rect.shrink2(egui::vec2(7.0, 6.0)), name, t.text_faint.gamma_multiply(0.45));
+    resp.on_hover_text(tip)
+}
+
 /// A smaller borderless icon button for panel footers and the options bar.
 pub fn small(ui: &mut Ui, name: &str, tip: &str) -> Response {
     let t = Tokens::get(ui.ctx());

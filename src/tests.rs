@@ -149,7 +149,7 @@ fn ink_and_picture_round_trip() {
     image::DynamicImage::ImageRgba8(im).write_to(&mut std::io::Cursor::new(&mut png), image::ImageFormat::Png).unwrap();
     let tex = ctx.load_texture("t", eframe::egui::ColorImage::filled([2, 2], Color32::GREEN), Default::default());
     let mut doc = Doc::new_blank();
-    let data = Arc::new(crate::doc::ImageData { bytes: Arc::new(png), px: [8, 8], tex });
+    let data = Arc::new(crate::doc::ImageData::new(Arc::new(png), [8, 8], Some(tex)));
     doc.pages[0].objects.push(Obj { rect: Rect::from_min_max(pos2(300.0, 300.0), pos2(400.0, 400.0)), kind: Kind::Image(data) });
     let strokes = vec![vec![pos2(0.0, 0.5), pos2(1.0, 0.5)]];
     doc.pages[0].objects.push(Obj {
@@ -170,4 +170,17 @@ fn jpeg_marker_reader() {
     image::DynamicImage::ImageRgb8(im).write_to(&mut std::io::Cursor::new(&mut jpg), image::ImageFormat::Jpeg).unwrap();
     assert_eq!(export::jpeg_components(&jpg), Some(3));
     assert_eq!(export::jpeg_components(b"not a jpeg"), None);
+}
+
+#[test]
+fn closed_filled_path_round_trip() {
+    use crate::path::Node;
+    let mut doc = Doc::new_blank();
+    let mut o = Obj { rect: Rect::NOTHING, kind: Kind::Path { nodes: Arc::new(vec![]), closed: true, stroke: Color32::BLACK, fill: Some(Color32::RED), width: 1.0 } };
+    let tri = [Node::corner(pos2(100.0, 100.0)), Node::corner(pos2(300.0, 100.0)), Node::corner(pos2(200.0, 300.0))];
+    o.set_path_abs(&tri, true);
+    doc.pages[0].objects.push(o);
+    let img = render(&export::save(&doc).unwrap(), 0);
+    assert!(is_red(px(&img, 200.0, 160.0)));
+    assert!(is_white(px(&img, 120.0, 250.0)));
 }

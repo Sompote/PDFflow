@@ -14,6 +14,27 @@ use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
+#[path = "pen.rs"]
+mod pen;
+#[path = "rtools.rs"]
+mod rtools;
+#[path = "signui.rs"]
+mod signui;
+#[path = "notes.rs"]
+mod notes;
+use pen::{Part, PenDraft};
+use rtools::{Live, PixSel, RasterOpts};
+use signui::{CreateDialog, ImportDialog, SignDialog};
+use notes::NoteEdit;
+#[cfg(test)]
+pub(crate) fn notes_without_comments_for_test(b: &[u8]) -> Option<Vec<u8>> {
+    notes::without_comments(b)
+}
+#[cfg(test)]
+pub(crate) mod signui_dialog {
+    pub(crate) use super::signui::SignDialog;
+}
+
 /// Space between pages and around the page column, in PDF points.
 const GAP: f32 = 16.0;
 const MARGIN: f32 = 24.0;
@@ -24,28 +45,64 @@ pub enum Tool {
     Move,
     Hand,
     Text,
-    Pen,
+    Brush,
     Highlighter,
+    PenPath,
+    FreeformPen,
+    CurvaturePen,
+    AddAnchor,
+    DeleteAnchor,
+    ConvertPoint,
+    Marquee,
+    Lasso,
+    Crop,
+    Eyedropper,
+    Heal,
+    PaintBrush,
+    CloneStamp,
+    Eraser,
+    Gradient,
+    Blur,
+    Dodge,
     Line,
     Arrow,
     Rect,
     Ellipse,
     Whiteout,
     Signature,
+    Comment,
 }
 
 const TOOLS: &[(Tool, &str, &str, Key)] = &[
     (Tool::Move, "mouse-pointer-2", "Move (V)", Key::V),
     (Tool::Hand, "hand", "Hand (H)", Key::H),
     (Tool::Text, "type", "Text (T)", Key::T),
-    (Tool::Pen, "pencil", "Pen (P)", Key::P),
+    (Tool::Brush, "pencil", "Brush (B)", Key::B),
     (Tool::Highlighter, "highlighter", "Highlighter (K)", Key::K),
+    (Tool::PenPath, "pen-tool", "Pen (P)", Key::P),
+    (Tool::FreeformPen, "pen-freeform", "Freeform Pen (P)", Key::P),
+    (Tool::CurvaturePen, "pen-curvature", "Curvature Pen (P)", Key::P),
+    (Tool::AddAnchor, "pen-add-anchor", "Add Anchor Point (P)", Key::P),
+    (Tool::DeleteAnchor, "pen-delete-anchor", "Delete Anchor Point (P)", Key::P),
+    (Tool::ConvertPoint, "convert-point", "Convert Point (P)", Key::P),
     (Tool::Line, "slash", "Line (L)", Key::L),
     (Tool::Arrow, "move-up-right", "Arrow (A)", Key::A),
     (Tool::Rect, "square", "Rectangle (R)", Key::R),
     (Tool::Ellipse, "circle", "Ellipse (E)", Key::E),
     (Tool::Whiteout, "eraser", "Whiteout: cover content with white (W)", Key::W),
     (Tool::Signature, "signature", "Signature (S)", Key::S),
+    (Tool::Comment, "message-square-text", "Comment (Z)", Key::Z),
+    (Tool::Marquee, "square-dashed", "Rectangular Marquee (M)", Key::M),
+    (Tool::Lasso, "lasso", "Lasso (Q)", Key::Q),
+    (Tool::Crop, "crop", "Crop (C)", Key::C),
+    (Tool::Eyedropper, "pipette", "Eyedropper (I)", Key::I),
+    (Tool::Heal, "bandage", "Spot Healing Brush (J)", Key::J),
+    (Tool::PaintBrush, "brush", "Brush (N)", Key::N),
+    (Tool::CloneStamp, "stamp", "Clone Stamp (Y)", Key::Y),
+    (Tool::Eraser, "eraser-background", "Eraser (X)", Key::X),
+    (Tool::Gradient, "blend", "Gradient (F)", Key::F),
+    (Tool::Blur, "droplet", "Blur (U)", Key::U),
+    (Tool::Dodge, "lollipop", "Dodge / Burn (O)", Key::O),
 ];
 
 impl Tool {
@@ -76,6 +133,14 @@ enum Drag {
     Draw { page: usize, pts: Vec<Pos2> },
     Create { page: usize, start: Pos2, cur: Pos2 },
     VScroll { grab: f32 },
+    PenPull { page: usize },
+    Freeform { page: usize, pts: Vec<Pos2> },
+    PathPoint { page: usize, idx: usize, node: usize, part: Part, symmetric: bool, before: Vec<PageEntry>, orig: Vec<crate::path::Node>, closed: bool, moved: bool },
+    RPaint { page: usize, idx: usize, last: Pos2, snapshot: crate::raster::Raster, before: Vec<PageEntry>, off: Option<Vec2>, alt: bool },
+    RSelect { page: usize, idx: usize, start: Pos2 },
+    RLasso { page: usize, idx: usize, pts: Vec<Pos2> },
+    RCrop { page: usize, idx: usize, start: Pos2 },
+    RGradient { page: usize, idx: usize, start: Pos2, cur: Pos2 },
 }
 
 struct Editing {
@@ -96,7 +161,7 @@ pub struct App {
     pub(crate) doc: Doc,
     renderer: Renderer,
     page_tex: HashMap<usize, (f32, TextureHandle)>,
-    thumbs: HashMap<usize, TextureHandle>,
+    thumbs: HashMap<usize, (f32, TextureHandle)>,
     thumb_want: Vec<Job>,
     thumb_seen: HashSet<usize>,
     last_want: Vec<Job>,
@@ -124,6 +189,33 @@ pub struct App {
     last_title: String,
     scroll_thumbs_to: Option<usize>,
     frames: u32,
+    grid: bool,
+    grid_size: f32,
+    grid_drag: Option<usize>,
+    pen: Option<PenDraft>,
+    pen_last: Tool,
+    flyout: Option<Pos2>,
+    flyout_frame: u64,
+    rlive: Option<Live>,
+    pix_sel: Option<PixSel>,
+    crop: Option<(usize, usize, Rect)>,
+    clone_src: Option<(usize, usize, Pos2)>,
+    ropts: RasterOpts,
+    two_cols: bool,
+    brand: Option<TextureHandle>,
+    ids: Vec<crate::sig::IdEntry>,
+    id_sel: usize,
+    sign_dlg: Option<SignDialog>,
+    create_dlg: Option<CreateDialog>,
+    import_dlg: Option<ImportDialog>,
+    delete_id: Option<usize>,
+    sig_reports: Vec<crate::dsig::SigReport>,
+    sig_panel: bool,
+    confirm_unsign: Option<bool>,
+    unsign_ok: bool,
+    note_edit: Option<NoteEdit>,
+    author: String,
+    note_color: Color32,
 }
 
 impl App {
@@ -172,6 +264,33 @@ impl App {
             last_title: String::new(),
             scroll_thumbs_to: None,
             frames: 0,
+            grid: false,
+            grid_size: 150.0,
+            grid_drag: None,
+            pen: None,
+            pen_last: Tool::PenPath,
+            flyout: None,
+            flyout_frame: 0,
+            rlive: None,
+            pix_sel: None,
+            crop: None,
+            clone_src: None,
+            ropts: RasterOpts::default(),
+            two_cols: false,
+            brand: None,
+            ids: crate::sig::load_ids(),
+            id_sel: 0,
+            sign_dlg: None,
+            create_dlg: None,
+            import_dlg: None,
+            delete_id: None,
+            sig_reports: Vec::new(),
+            sig_panel: false,
+            confirm_unsign: None,
+            unsign_ok: false,
+            note_edit: None,
+            author: notes::default_author(),
+            note_color: notes::NOTE_COLORS[0],
         };
         if let Some(p) = path {
             app.open_path(p);
@@ -192,6 +311,16 @@ impl App {
         self.scroll = Vec2::ZERO;
         self.fit_on_next = true;
         self.prop_session = None;
+        self.grid = false;
+        self.grid_drag = None;
+        self.pen = None;
+        self.rlive = None;
+        self.pix_sel = None;
+        self.crop = None;
+        self.clone_src = None;
+        self.sig_reports.clear();
+        self.sig_panel = false;
+        self.note_edit = None;
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -199,10 +328,14 @@ impl App {
             Ok(b) => Arc::new(b),
             Err(e) => return self.error = Some(format!("Cannot read {}: {e}", path.display())),
         };
-        match self.renderer.open(bytes.clone()) {
+        // The renderer gets the file without its comments; the editor draws those itself.
+        let render = notes::without_comments(&bytes).map(Arc::new).unwrap_or_else(|| bytes.clone());
+        match self.renderer.open(render) {
             Ok(sizes) if !sizes.is_empty() => {
-                self.doc = Doc::from_pdf(Some(path), bytes, &sizes);
+                self.doc = Doc::from_pdf(Some(path), bytes.clone(), &sizes);
                 self.reset_view();
+                self.sig_reports = crate::dsig::verify(&bytes);
+                self.import_comments(&bytes);
                 self.status = format!("Opened {} ({} pages)", self.doc.title(), self.doc.pages.len());
             }
             Ok(_) => self.error = Some("The PDF has no pages.".into()),
@@ -241,6 +374,11 @@ impl App {
 
     fn save(&mut self, save_as: bool) -> bool {
         self.end_edit();
+        // Edits rewrite the file, which drops existing digital signatures: ask first.
+        if !self.sig_reports.is_empty() && !self.doc.is_pristine() && !self.unsign_ok {
+            self.confirm_unsign = Some(save_as);
+            return false;
+        }
         let path = match (&self.doc.path, save_as) {
             (Some(p), false) => p.clone(),
             _ => {
@@ -256,7 +394,12 @@ impl App {
                 }
             }
         };
-        let result = export::save(&self.doc).and_then(|bytes| {
+        // An untouched document is written back byte for byte (signatures stay valid).
+        let bytes = match (&self.doc.source, self.doc.is_pristine()) {
+            (Some(src), true) => Ok(src.as_ref().clone()),
+            _ => export::save(&self.doc),
+        };
+        let result = bytes.and_then(|bytes| {
             let tmp = path.with_extension("pdf.tmp");
             std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
             std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
@@ -286,7 +429,7 @@ impl App {
     }
 
     /// Place a picture on a page, centred on `at` (page points) or the page centre.
-    fn insert_image(&mut self, ctx: &egui::Context, bytes: Vec<u8>, page: usize, at: Option<Pos2>) {
+    pub(crate) fn insert_image(&mut self, ctx: &egui::Context, bytes: Vec<u8>, page: usize, at: Option<Pos2>) {
         let img = match image::load_from_memory(&bytes) {
             Ok(i) => i,
             Err(e) => return self.error = Some(format!("Cannot read picture: {e}")),
@@ -304,7 +447,7 @@ impl App {
         let size = natural * fit;
         let c = at.unwrap_or(Rect::from_min_size(Pos2::ZERO, pe.size).center());
         let rect = Rect::from_center_size(c, size);
-        let data = Arc::new(ImageData { bytes: Arc::new(bytes), px: [w, h], tex });
+        let data = Arc::new(ImageData::new(Arc::new(bytes), [w, h], Some(tex)));
         self.doc.checkpoint();
         let objs = &mut self.doc.pages[page].objects;
         objs.push(Obj { rect, kind: Kind::Image(data) });
@@ -359,6 +502,20 @@ impl App {
             *cur = j;
         });
         self.scroll_to_page(self.current);
+    }
+
+    /// Move page `from` so it lands before the page now at `to` (`to` may equal the length).
+    pub(crate) fn move_page_to(&mut self, from: usize, to: usize) {
+        let n = self.doc.pages.len();
+        if from >= n || to > n || to == from || to == from + 1 {
+            return;
+        }
+        self.page_op(|pages, cur| {
+            let p = pages.remove(from);
+            let at = if to > from { to - 1 } else { to };
+            pages.insert(at, p);
+            *cur = at;
+        });
     }
 
     pub(crate) fn delete_page(&mut self, i: usize) {
@@ -552,7 +709,7 @@ impl App {
         while let Ok(done) = self.renderer.rx.try_recv() {
             let tex = ctx.load_texture(format!("page{}", done.job.page), done.image, TextureOptions::LINEAR);
             if done.job.thumb {
-                self.thumbs.insert(done.job.page, tex);
+                self.thumbs.insert(done.job.page, (done.job.scale, tex));
             } else {
                 self.page_tex.insert(done.job.page, (done.job.scale, tex));
             }
@@ -615,17 +772,29 @@ impl App {
         }
         if sc(cmd_shift, Key::Z) {
             self.end_edit();
+            self.note_edit = None;
+            self.pen = None;
             if self.doc.redo() {
                 self.sel = None;
             }
         }
         if sc(Modifiers::COMMAND, Key::Z) {
             self.end_edit();
+            self.note_edit = None;
+            self.pen = None;
             if self.doc.undo() {
                 self.sel = None;
             }
         }
-        if sc(Modifiers::COMMAND, Key::D) {
+        if self.tool.is_raster() {
+            if sc(Modifiers::COMMAND, Key::J) {
+                self.picture_from_selection();
+            }
+            if sc(Modifiers::COMMAND, Key::A) {
+                self.select_all_pixels(ctx);
+            }
+        }
+        if sc(Modifiers::COMMAND, Key::D) && self.pix_sel.take().is_none() {
             if let Some(o) = self.selected().cloned() {
                 self.clipboard = Some(o);
                 self.paste();
@@ -647,16 +816,66 @@ impl App {
         if mods.command || mods.alt {
             return;
         }
+        if ctx.input(|i| i.key_pressed(Key::G)) {
+            self.toggle_grid();
+            return;
+        }
+        if self.grid {
+            if ctx.input(|i| i.key_pressed(Key::Escape) || i.key_pressed(Key::Enter)) {
+                self.toggle_grid();
+            } else if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                self.delete_page(self.current);
+            } else if ctx.input(|i| i.key_pressed(Key::ArrowRight) || i.key_pressed(Key::ArrowDown)) {
+                self.current = (self.current + 1).min(self.doc.pages.len() - 1);
+                self.scroll_thumbs_to = Some(self.current);
+            } else if ctx.input(|i| i.key_pressed(Key::ArrowLeft) || i.key_pressed(Key::ArrowUp)) {
+                self.current = self.current.saturating_sub(1);
+                self.scroll_thumbs_to = Some(self.current);
+            }
+            return;
+        }
+        if self.pen.is_some() {
+            if ctx.input(|i| i.key_pressed(Key::Enter) || i.key_pressed(Key::Escape)) {
+                self.finish_pen(false);
+                return;
+            }
+            if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
+                self.pen_backspace();
+                return;
+            }
+        }
         for (tool, _, _, key) in TOOLS {
-            if ctx.input(|i| i.key_pressed(*key)) {
+            if !tool.is_pen() && ctx.input(|i| i.key_pressed(*key)) {
                 self.set_tool(*tool);
             }
         }
+        if ctx.input(|i| i.key_pressed(Key::P)) {
+            self.pen_key(mods.shift);
+        }
+        if self.tool.is_raster() {
+            if ctx.input(|i| i.key_pressed(Key::OpenBracket)) {
+                self.ropts.size = (self.ropts.size / 1.2).max(1.0);
+            }
+            if ctx.input(|i| i.key_pressed(Key::CloseBracket)) {
+                self.ropts.size = (self.ropts.size * 1.2).min(500.0);
+            }
+            if let Some((_, _, q)) = self.crop {
+                if ctx.input(|i| i.key_pressed(Key::Enter)) {
+                    self.crop_picture(q);
+                }
+            }
+        }
         if ctx.input(|i| i.key_pressed(Key::Delete) || i.key_pressed(Key::Backspace)) {
-            self.delete_selected();
+            if self.pix_sel.is_some() && self.tool.is_raster() {
+                self.delete_pixels();
+            } else {
+                self.delete_selected();
+            }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            self.sel = None;
+            if self.crop.take().is_none() && self.pix_sel.take().is_none() {
+                self.sel = None;
+            }
         }
         let step = if mods.shift { 10.0 } else { 1.0 };
         let mut nudge = Vec2::ZERO;
@@ -691,8 +910,33 @@ impl App {
         }
     }
 
-    fn set_tool(&mut self, tool: Tool) {
+    fn toggle_grid(&mut self) {
         self.end_edit();
+        self.grid = !self.grid;
+        self.grid_drag = None;
+        self.sel = None;
+        if self.grid {
+            self.scroll_thumbs_to = Some(self.current);
+        } else {
+            self.scroll_to_page(self.current);
+        }
+    }
+
+    pub(crate) fn set_tool(&mut self, tool: Tool) {
+        if tool.is_raster() && self.picture_sel().is_none() {
+            self.status = "Select a picture to use the picture tools.".into();
+            return;
+        }
+        self.end_edit();
+        if self.pen.is_some() && !matches!(tool, Tool::PenPath | Tool::CurvaturePen) {
+            self.finish_pen(false);
+        }
+        if tool.is_pen() {
+            self.pen_last = tool;
+        }
+        if self.grid && tool != Tool::Move {
+            self.toggle_grid();
+        }
         self.tool = tool;
         if tool == Tool::Signature && self.sigs.is_empty() {
             self.sig_pad = Some(sig::Pad::default());
@@ -705,9 +949,13 @@ impl App {
         let ctx = ui.ctx().clone();
         egui::MenuBar::new().ui(ui, |ui| {
             let t = Tokens::get(ui.ctx());
-            let (r, _) = ui.allocate_exact_size(vec2(26.0, 22.0), Sense::hover());
-            ui.painter().rect_filled(r, 4.0, t.accent);
-            ui.painter().text(r.center(), egui::Align2::CENTER_CENTER, "Pdf", FontId::proportional(10.5), Color32::WHITE);
+            let (r, _) = ui.allocate_exact_size(vec2(24.0, 24.0), Sense::hover());
+            let tex = self.brand.get_or_insert_with(|| {
+                let img = image::load_from_memory(crate::ICON_PNG).expect("bundled icon").thumbnail(96, 96).to_rgba8();
+                let ci = egui::ColorImage::from_rgba_unmultiplied([img.width() as usize, img.height() as usize], img.as_raw());
+                ui.ctx().load_texture("brand", ci, TextureOptions::LINEAR)
+            });
+            ui.painter().image(tex.id(), r, Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)), Color32::WHITE);
             let cmd = if cfg!(target_os = "macos") { "⌘" } else { "Ctrl+" };
             let item = |ui: &mut Ui, label: &str, sc: &str| ui.add(egui::Button::new(label).shortcut_text(if sc.is_empty() { String::new() } else { format!("{cmd}{sc}") })).clicked();
             ui.menu_button("File", |ui| {
@@ -725,6 +973,9 @@ impl App {
                     self.save(true);
                 }
                 ui.separator();
+                if item(ui, "Sign with Digital ID…", "") {
+                    self.open_sign_dialog();
+                }
                 if item(ui, "Place Picture…", "") {
                     self.insert_image_dialog(&ctx);
                 }
@@ -797,6 +1048,15 @@ impl App {
                 }
             });
             ui.menu_button("View", |ui| {
+                if ui.button("Signature Panel…").clicked() {
+                    self.sig_panel = true;
+                    ui.close();
+                }
+                if ui.add(egui::Button::selectable(self.grid, "Page Grid").shortcut_text("G")).clicked() {
+                    self.toggle_grid();
+                    ui.close();
+                }
+                ui.separator();
                 if item(ui, "Zoom In", "+") {
                     self.zoom_center(self.zoom * 1.25);
                 }
@@ -831,9 +1091,20 @@ impl App {
         ui.horizontal_centered(|ui| {
             let (r, _) = ui.allocate_exact_size(vec2(26.0, 26.0), Sense::hover());
             ui.painter().rect_filled(r, t.radius_sm, t.field);
-            icons::paint(ui.painter(), r.shrink(5.0), self.tool.icon(), t.icon);
-            ui.label(self.tool.name());
+            icons::paint(ui.painter(), r.shrink(5.0), if self.grid { "layout-grid" } else { self.tool.icon() }, t.icon);
+            ui.label(if self.grid { "Page Grid" } else { self.tool.name() });
             vline(ui, 22.0);
+            if self.tool.is_raster() {
+                self.raster_options(ui);
+                return;
+            }
+            if self.grid {
+                option_label(ui, "Thumbnail size:");
+                ui.add(egui::Slider::new(&mut self.grid_size, 80.0..=400.0).show_value(false));
+                vline(ui, 22.0);
+                ui.label(egui::RichText::new(format!("{} pages. Double-click a page to open it, drag to reorder, right-click for page commands. G or Esc returns.", self.doc.pages.len())).color(t.text_faint));
+                return;
+            }
             // With the Move tool, the bar edits the selected object (Photoshop's Properties).
             if self.tool == Tool::Move || (self.tool == Tool::Text && self.editing.is_some()) {
                 self.object_options(ui);
@@ -845,7 +1116,28 @@ impl App {
                     vline(ui, 22.0);
                     ui.label(egui::RichText::new("Click on a page to type. Font: Sarabun (Thai and Latin).").color(t.text_faint));
                 }
-                Tool::Pen | Tool::Line | Tool::Arrow => {
+                Tool::PenPath | Tool::FreeformPen | Tool::CurvaturePen | Tool::AddAnchor | Tool::DeleteAnchor | Tool::ConvertPoint => {
+                    stroke_controls(ui, &mut self.opts.color, &mut self.opts.width);
+                    vline(ui, 22.0);
+                    let mut on = self.opts.fill.is_some();
+                    if widgets::checkbox(ui, &mut on, "Fill").changed() {
+                        self.opts.fill = on.then_some(Color32::from_rgb(255, 240, 160));
+                    }
+                    if let Some(f) = &mut self.opts.fill {
+                        egui::color_picker::color_edit_button_srgba(ui, f, egui::color_picker::Alpha::Opaque);
+                    }
+                    vline(ui, 22.0);
+                    let hint = match self.tool {
+                        Tool::PenPath => "Click for corners, drag for curves. Click the first point to close; Enter ends.",
+                        Tool::FreeformPen => "Drag to draw; the stroke becomes an editable path.",
+                        Tool::CurvaturePen => "Click points on a smooth curve; Alt-click for a corner. Enter ends.",
+                        Tool::AddAnchor => "Click a path segment to add an anchor.",
+                        Tool::DeleteAnchor => "Click an anchor to remove it.",
+                        _ => "Click an anchor: corner ⇄ smooth. Drag a handle to break its pair.",
+                    };
+                    ui.label(egui::RichText::new(hint).color(t.text_faint));
+                }
+                Tool::Brush | Tool::Line | Tool::Arrow => {
                     stroke_controls(ui, &mut self.opts.color, &mut self.opts.width);
                 }
                 Tool::Highlighter => {
@@ -862,6 +1154,26 @@ impl App {
                         egui::color_picker::color_edit_button_srgba(ui, f, egui::color_picker::Alpha::Opaque);
                     }
                 }
+                Tool::Comment => {
+                    option_label(ui, "Author:");
+                    if ui.add(egui::TextEdit::singleline(&mut self.author).desired_width(130.0)).lost_focus() {
+                        let a = self.author.clone();
+                        let _ = crate::sig::config_dir().map(|d| std::fs::write(d.join("author.txt"), a));
+                    }
+                    option_label(ui, "Colour:");
+                    for nc in notes::NOTE_COLORS {
+                        let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                        ui.painter().rect_filled(r, 3.0, nc);
+                        if self.note_color == nc {
+                            ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, t.accent), StrokeKind::Outside);
+                        }
+                        if resp.clicked() {
+                            self.note_color = nc;
+                        }
+                    }
+                    vline(ui, 22.0);
+                    ui.label(egui::RichText::new("Click a page to add a comment; it is saved as a PDF comment other readers show.").color(t.text_faint));
+                }
                 Tool::Whiteout => {
                     ui.label(egui::RichText::new("Drag over content to cover it with white, then type on top with the Text tool.").color(t.text_faint));
                 }
@@ -876,6 +1188,7 @@ impl App {
                         ui.label(egui::RichText::new("Click on a page to place the selected signature.").color(t.text_faint));
                     }
                 }
+                Tool::Marquee | Tool::Lasso | Tool::Crop | Tool::Eyedropper | Tool::Heal | Tool::PaintBrush | Tool::CloneStamp | Tool::Eraser | Tool::Gradient | Tool::Blur | Tool::Dodge => {}
                 Tool::Hand | Tool::Move => {
                     ui.label(egui::RichText::new("Drag to scroll. Hold Space with any tool to pan; ⌘-scroll or pinch to zoom.").color(t.text_faint));
                 }
@@ -896,6 +1209,35 @@ impl App {
         let changed = match &mut obj.kind {
             Kind::Text { size, bold, color, .. } => text_controls(ui, size, bold, color),
             Kind::Ink { color, width, .. } => stroke_controls(ui, color, width),
+            Kind::Note { color, .. } => {
+                option_label(ui, "Colour:");
+                let mut c = false;
+                for nc in notes::NOTE_COLORS {
+                    let (r, resp) = ui.allocate_exact_size(vec2(16.0, 16.0), Sense::click());
+                    ui.painter().rect_filled(r, 3.0, nc);
+                    if *color == nc {
+                        ui.painter().rect_stroke(r, 3.0, Stroke::new(2.0, t.accent), StrokeKind::Outside);
+                    }
+                    if resp.clicked() {
+                        *color = nc;
+                        c = true;
+                    }
+                }
+                c
+            }
+            Kind::Path { stroke, width, fill, .. } => {
+                let mut c = stroke_controls(ui, stroke, width);
+                vline(ui, 22.0);
+                let mut on = fill.is_some();
+                if widgets::checkbox(ui, &mut on, "Fill").changed() {
+                    *fill = on.then_some(Color32::from_rgb(255, 240, 160));
+                    c = true;
+                }
+                if let Some(f) = fill {
+                    c |= egui::color_picker::color_edit_button_srgba(ui, f, egui::color_picker::Alpha::Opaque).changed();
+                }
+                c
+            }
             Kind::Shape { stroke, width, fill, shape, .. } => {
                 let mut c = stroke_controls(ui, stroke, width);
                 if matches!(shape, ShapeKind::Rect | ShapeKind::Ellipse) {
@@ -950,28 +1292,72 @@ impl App {
         }
     }
 
+    /// Tool groups as laid out in the column (separators between groups).
+    fn tool_groups() -> Vec<Vec<Tool>> {
+        vec![
+            vec![Tool::Move, Tool::Hand],
+            vec![Tool::Text, Tool::Brush, Tool::Highlighter, Tool::PenPath],
+            vec![Tool::Line, Tool::Arrow, Tool::Rect, Tool::Ellipse],
+            vec![Tool::Whiteout, Tool::Signature, Tool::Comment],
+            rtools::RASTER_TOOLS.to_vec(),
+        ]
+    }
+
+    /// One column when it fits, two (as PhotoCraft does) when the window is short.
+    fn tool_columns_needed(height: f32) -> bool {
+        let buttons: usize = Self::tool_groups().iter().map(Vec::len).sum::<usize>() + 2;
+        let needed = buttons as f32 * 30.0 + 6.0 * 9.0 + 16.0;
+        needed > height
+    }
+
     fn tool_column(&mut self, ui: &mut Ui) {
+        let cols = if self.two_cols { 2 } else { 1 };
+        let picture = self.picture_sel().is_some();
         ui.add_space(6.0);
         ui.vertical_centered(|ui| {
-            ui.spacing_mut().item_spacing.y = 2.0;
-            for (i, (tool, icon, tip, _)) in TOOLS.iter().enumerate() {
-                if matches!(i, 2 | 5 | 9) {
-                    ui.add_space(4.0);
+            ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+            for (g, group) in Self::tool_groups().into_iter().enumerate() {
+                if g > 0 {
+                    ui.add_space(3.0);
                     widgets_hline(ui);
-                    ui.add_space(4.0);
+                    ui.add_space(3.0);
                 }
-                if icons::button(ui, icon, self.tool == *tool, tip).clicked() {
-                    self.set_tool(*tool);
+                for row in group.chunks(cols) {
+                    ui.horizontal(|ui| {
+                        if cols == 2 && row.len() == 1 {
+                            ui.add_space(0.0);
+                        }
+                        for tool in row {
+                            if tool.is_pen() {
+                                self.pen_slot(ui);
+                                continue;
+                            }
+                            let tip = TOOLS.iter().find(|x| x.0 == *tool).map(|x| x.2).unwrap_or("");
+                            let enabled = !tool.is_raster() || picture;
+                            let tip = if enabled { tip.to_owned() } else { format!("{tip} · select a picture first") };
+                            if icons::button_state(ui, tool.icon(), self.tool == *tool, enabled, &tip).clicked() {
+                                self.set_tool(*tool);
+                            }
+                        }
+                    });
                 }
             }
-            ui.add_space(4.0);
+            ui.add_space(3.0);
             widgets_hline(ui);
-            ui.add_space(4.0);
-            if icons::button(ui, "image", false, "Place picture… (or drag a picture onto a page)").clicked() {
-                let ctx = ui.ctx().clone();
-                self.insert_image_dialog(&ctx);
-            }
-            if icons::button(ui, "file-plus", false, "Insert blank page after the current page").clicked() {
+            ui.add_space(3.0);
+            ui.horizontal(|ui| {
+                if icons::button(ui, "image", false, "Place picture… (or drag a picture onto a page)").clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.insert_image_dialog(&ctx);
+                }
+                if cols == 1 {
+                    return;
+                }
+                if icons::button(ui, "file-plus", false, "Insert blank page after the current page").clicked() {
+                    self.add_blank(self.current + 1);
+                }
+            });
+            if cols == 1 && icons::button(ui, "file-plus", false, "Insert blank page after the current page").clicked() {
                 self.add_blank(self.current + 1);
             }
         });
@@ -981,12 +1367,26 @@ impl App {
         let h = ui.available_height() - 6.0;
         ui.add_space(4.0);
         let mut tab = self.dock_tabs[0];
-        widgets::card(ui, "pages", &["Pages"], &mut tab, h * 0.52, |ui, _| self.pages_panel(ui));
+        widgets::card(ui, "pages", &["Pages"], &mut tab, h * 0.46, |ui, _| self.pages_panel(ui));
         let mut tab = self.dock_tabs[1];
-        widgets::card(ui, "layers", &["Layers"], &mut tab, h * 0.28, |ui, _| self.layers_panel(ui));
+        widgets::card(ui, "layers", &["Layers", "Comments"], &mut tab, h * 0.24, |ui, sel| {
+            if sel == 0 {
+                self.layers_panel(ui)
+            } else {
+                self.comments_panel(ui)
+            }
+        });
+        self.dock_tabs[1] = tab;
         let mut tab = self.dock_tabs[2];
         let rest = ui.available_height() - 4.0;
-        widgets::card(ui, "sigs", &["Signatures"], &mut tab, rest, |ui, _| self.sigs_panel(ui));
+        widgets::card(ui, "sigs", &["Signatures", "Digital IDs"], &mut tab, rest, |ui, sel| {
+            if sel == 0 {
+                self.sigs_panel(ui)
+            } else {
+                self.ids_panel(ui)
+            }
+        });
+        self.dock_tabs[2] = tab;
     }
 
     fn pages_panel(&mut self, ui: &mut Ui) {
@@ -1015,26 +1415,7 @@ impl App {
                 } else if resp.hovered() {
                     ui.painter().rect_filled(row.shrink(1.0), t.radius_sm, t.hover);
                 }
-                ui.painter().rect_filled(r, 0.0, Color32::WHITE);
-                if let PageSrc::Original(src) = page.src {
-                    self.thumb_seen.insert(src);
-                    match self.thumbs.get(&src) {
-                        Some(tex) => paint_page_texture(ui.painter(), page, r, tex),
-                        None => {
-                            let scale = quantize(w * ppp / vs.x);
-                            let job = Job { page: src, scale, thumb: true };
-                            if !self.thumb_want.contains(&job) {
-                                self.thumb_want.push(job);
-                            }
-                        }
-                    }
-                }
-                // Placed objects are drawn on the thumbnail as well.
-                let z = w / vs.x;
-                let painter = ui.painter_at(r);
-                for o in &page.objects {
-                    paint_obj(&painter, page, r.min, z, o);
-                }
+                paint_thumb(ui.painter(), page, r, ppp, &self.thumbs, &mut self.thumb_want, &mut self.thumb_seen);
                 ui.painter().rect_stroke(r, 0.0, Stroke::new(if i == self.current { 2.0 } else { 1.0 }, if i == self.current { t.accent } else { t.separator }), StrokeKind::Outside);
                 ui.painter().text(pos2(row.center().x, r.bottom() + 11.0), egui::Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(11.0), t.text_dim);
                 if resp.clicked() {
@@ -1194,7 +1575,17 @@ impl App {
                 self.zoom_center(self.zoom * 1.25);
             }
             if icons::small(ui, "maximize", "Fit page (⌘0)").clicked() {
+                self.grid = false;
                 self.fit_page();
+            }
+            vline(ui, 16.0);
+            let tip = if self.grid { "Back to the page view (G)" } else { "Page grid: see all pages (G)" };
+            let r = icons::small(ui, "layout-grid", tip);
+            if self.grid {
+                ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+            }
+            if r.clicked() {
+                self.toggle_grid();
             }
             vline(ui, 16.0);
             ui.label(egui::RichText::new(&self.status).color(t.text_faint));
@@ -1204,6 +1595,13 @@ impl App {
     // ------------------------------------------------------------------------------- canvas
 
     fn canvas(&mut self, ui: &mut Ui) {
+        if self.grid {
+            self.grid_view(ui);
+            let jobs = std::mem::take(&mut self.thumb_want);
+            self.send_jobs(jobs);
+            return;
+        }
+        self.upload_dirty();
         let t = Tokens::get(ui.ctx());
         let ctx = ui.ctx().clone();
         let rect = ui.max_rect();
@@ -1272,7 +1670,10 @@ impl App {
             let clip = painter.with_clip_rect(r.intersect(rect));
             for (k, o) in page.objects.iter().enumerate() {
                 if editing != Some((i, k)) {
-                    paint_obj(&clip, page, r.min, self.zoom, o);
+                    match self.live_texture(i, k) {
+                        Some(tid) => paint_image(&clip, page, r.min, self.zoom, o.rect, tid),
+                        None => paint_obj(&clip, page, r.min, self.zoom, o),
+                    }
                 }
             }
         }
@@ -1283,6 +1684,10 @@ impl App {
                 Drag::Draw { page, pts } => {
                     let (hl, color, width) = self.ink_style();
                     let o = Obj { rect: Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)), kind: Kind::Ink { strokes: Arc::new(vec![pts.clone()]), color, width, highlighter: hl } };
+                    paint_obj(&painter, &self.doc.pages[*page], rects[*page].min, self.zoom, &o);
+                }
+                Drag::Freeform { page, pts } => {
+                    let o = Obj { rect: Rect::from_min_size(Pos2::ZERO, vec2(1.0, 1.0)), kind: Kind::Ink { strokes: Arc::new(vec![pts.clone()]), color: self.opts.color, width: self.opts.width, highlighter: false } };
                     paint_obj(&painter, &self.doc.pages[*page], rects[*page].min, self.zoom, &o);
                 }
                 Drag::Create { page, start, cur } => {
@@ -1299,10 +1704,11 @@ impl App {
             if let Some(o) = self.doc.pages.get(p).and_then(|pg| pg.objects.get(i)) {
                 let pg = &self.doc.pages[p];
                 let sr = screen_rect(pg, rects[p].min, self.zoom, o.rect);
-                if !is_line(o) {
+                let pen_edit = self.tool.is_pen() && matches!(o.kind, Kind::Path { .. });
+                if !is_line(o) && !pen_edit {
                     painter.rect_stroke(sr, 0.0, Stroke::new(1.0, t.accent), StrokeKind::Outside);
                 }
-                if editing.is_none() {
+                if editing.is_none() && !pen_edit && !self.tool.is_raster() {
                     for (_, hp) in handles(o) {
                         let s = rects[p].min + pg.to_view(hp).to_vec2() * self.zoom;
                         let hr = Rect::from_center_size(s, vec2(8.0, 8.0));
@@ -1313,6 +1719,8 @@ impl App {
             }
         }
 
+        self.pen_overlay(&painter, &rects, pointer);
+        self.raster_overlay(&painter, &rects, pointer);
         self.text_editor(ui, &rects);
 
         // Drop hint.
@@ -1328,15 +1736,149 @@ impl App {
         if self.page_tex.len() > visible.len() + 4 {
             self.page_tex.retain(|k, _| visible.contains(k));
         }
-        if self.thumbs.len() > MAX_THUMBS {
+        if self.thumbs.len() > MAX_THUMBS.max(self.thumb_seen.len() + 8) {
             let seen = &self.thumb_seen;
             self.thumbs.retain(|k, _| seen.contains(k));
         }
         jobs.extend(std::mem::take(&mut self.thumb_want));
+        self.send_jobs(jobs);
+    }
+
+    fn send_jobs(&mut self, jobs: Vec<Job>) {
         if jobs != self.last_want {
             self.renderer.want(jobs.clone());
             self.last_want = jobs;
         }
+    }
+
+    /// Every page as a thumbnail. Click selects, double-click opens the page, drag reorders,
+    /// right-click offers the page commands.
+    fn grid_view(&mut self, ui: &mut Ui) {
+        let t = Tokens::get(ui.ctx());
+        let ctx = ui.ctx().clone();
+        let ppp = ctx.pixels_per_point();
+        let rect = ui.max_rect();
+        self.view = rect;
+        ui.painter().rect_filled(rect, 0.0, t.canvas);
+        // ⌘-scroll or pinch changes the thumbnail size.
+        let zd = ui.input(|i| i.zoom_delta());
+        if zd != 1.0 && ui.rect_contains_pointer(rect) {
+            self.grid_size = (self.grid_size * zd).clamp(80.0, 400.0);
+        }
+        let w = self.grid_size;
+        let cell = vec2(w + 28.0, w * 1.3 + 44.0);
+        let n = self.doc.pages.len();
+        let mut open = None;
+        let mut select = None;
+        let mut menu_action: Option<(usize, u8)> = None;
+        let mut reorder: Option<(usize, usize)> = None;
+        let scroll_to = self.scroll_thumbs_to.take();
+        let pointer = ui.input(|i| i.pointer.hover_pos());
+        let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
+        egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]).show(&mut child, |ui| {
+            let avail = ui.available_width();
+            let cols = ((avail - 24.0) / cell.x).floor().max(1.0) as usize;
+            let rows = n.div_ceil(cols);
+            let left = ((avail - cols as f32 * cell.x) / 2.0).max(12.0);
+            let (area, _) = ui.allocate_exact_size(vec2(avail, rows as f32 * cell.y + 24.0), Sense::hover());
+            let cell_rect = |i: usize| Rect::from_min_size(area.min + vec2(left + (i % cols) as f32 * cell.x, 12.0 + (i / cols) as f32 * cell.y), cell);
+            // Insertion slot under the pointer while dragging a page.
+            let slot = self.grid_drag.and(pointer).map(|p| {
+                let col = ((p.x - area.min.x - left) / cell.x).clamp(0.0, cols as f32 - 0.01);
+                let row = ((p.y - area.min.y - 12.0) / cell.y).max(0.0) as usize;
+                let c = col as usize;
+                let after = col.fract() > 0.5;
+                (row * cols + c + after as usize).min(n)
+            });
+            for i in 0..n {
+                let cr = cell_rect(i);
+                if scroll_to == Some(i) {
+                    ui.scroll_to_rect(cr, Some(egui::Align::Center));
+                }
+                if !ui.is_rect_visible(cr) && self.grid_drag != Some(i) {
+                    continue;
+                }
+                let page = &self.doc.pages[i];
+                let vs = page.view_size();
+                let fit = (w / vs.x).min(w * 1.3 / vs.y);
+                let tr = Rect::from_center_size(pos2(cr.center().x, cr.top() + 8.0 + w * 0.65), vs * fit);
+                let resp = ui.interact(cr, Id::new(("grid-page", i)), Sense::click_and_drag());
+                let on = i == self.current;
+                if on {
+                    ui.painter().rect_filled(cr.shrink(3.0), t.radius, t.row_selected);
+                } else if resp.hovered() {
+                    ui.painter().rect_filled(cr.shrink(3.0), t.radius, t.hover);
+                }
+                ui.painter().rect_filled(tr.translate(vec2(0.0, 2.0)).expand(1.0), 0.0, Color32::from_black_alpha(60));
+                let faded = self.grid_drag == Some(i);
+                paint_thumb(ui.painter(), page, tr, ppp, &self.thumbs, &mut self.thumb_want, &mut self.thumb_seen);
+                if faded {
+                    ui.painter().rect_filled(tr, 0.0, Color32::from_black_alpha(120));
+                }
+                ui.painter().rect_stroke(tr, 0.0, Stroke::new(if on { 2.0 } else { 1.0 }, if on { t.accent } else { t.separator }), StrokeKind::Outside);
+                let label = if page.objects.is_empty() { format!("{}", i + 1) } else { format!("{}  ·  {} edits", i + 1, page.objects.len()) };
+                ui.painter().text(pos2(cr.center().x, cr.bottom() - 16.0), egui::Align2::CENTER_CENTER, label, FontId::proportional(12.0), if on { t.text } else { t.text_dim });
+                if resp.double_clicked() {
+                    open = Some(i);
+                } else if resp.clicked() {
+                    select = Some(i);
+                }
+                if resp.drag_started() {
+                    self.grid_drag = Some(i);
+                    select = Some(i);
+                }
+                if resp.drag_stopped() {
+                    if let Some(to) = slot {
+                        reorder = Some((i, to));
+                    }
+                    self.grid_drag = None;
+                }
+                resp.context_menu(|ui| {
+                    for (k, label) in [(0, "Insert Blank Page After"), (1, "Duplicate Page"), (2, "Rotate Right 90°"), (3, "Rotate Left 90°"), (4, "Delete Page"), (5, "Open Page")] {
+                        if ui.button(label).clicked() {
+                            menu_action = Some((i, k));
+                            ui.close();
+                        }
+                    }
+                });
+            }
+            if let (Some(to), Some(from)) = (slot, self.grid_drag) {
+                if to != from && to != from + 1 {
+                    // Accent bar at the insertion point.
+                    let (r, x) = if to < n { (cell_rect(to), 0.0) } else { (cell_rect(n - 1), cell.x) };
+                    let x = r.left() + x;
+                    ui.painter().line_segment([pos2(x, r.top() + 8.0), pos2(x, r.bottom() - 28.0)], Stroke::new(3.0, t.accent));
+                }
+                ctx.set_cursor_icon(CursorIcon::Grabbing);
+            }
+        });
+        if let Some(i) = select {
+            self.current = i;
+        }
+        if let Some((from, to)) = reorder {
+            self.move_page_to(from, to);
+        }
+        if let Some((i, k)) = menu_action {
+            self.current = i;
+            match k {
+                0 => self.add_blank(i + 1),
+                1 => self.duplicate_page(i),
+                2 => self.rotate_page(i, 90),
+                3 => self.rotate_page(i, 270),
+                4 => self.delete_page(i),
+                _ => open = Some(i),
+            }
+        }
+        if let Some(i) = open {
+            self.current = i;
+            self.grid = false;
+            self.scroll_to_page(i);
+        }
+        if ctx.input(|i| !i.raw.hovered_files.is_empty()) {
+            ui.painter().rect_filled(rect, 0.0, Color32::from_black_alpha(90));
+            ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, "Drop a PDF to open it", FontId::proportional(16.0), Color32::WHITE);
+        }
+        self.handle_drops(&ctx, &[]);
     }
 
     fn ink_style(&self) -> (bool, Color32, f32) {
@@ -1461,7 +2003,26 @@ impl App {
                         self.start_edit(pi, k, before);
                     }
                 }
-                Tool::Pen | Tool::Highlighter => {
+                Tool::PenPath | Tool::FreeformPen | Tool::CurvaturePen | Tool::AddAnchor | Tool::DeleteAnchor | Tool::ConvertPoint => {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    self.pen_press(rects, p, hit, alt);
+                }
+                Tool::Marquee
+                | Tool::Lasso
+                | Tool::Crop
+                | Tool::Eyedropper
+                | Tool::Heal
+                | Tool::PaintBrush
+                | Tool::CloneStamp
+                | Tool::Eraser
+                | Tool::Gradient
+                | Tool::Blur
+                | Tool::Dodge => {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    let ctx = ui.ctx().clone();
+                    self.raster_press(&ctx, rects, p, alt);
+                }
+                Tool::Brush | Tool::Highlighter => {
                     if let Some((pi, pp)) = hit {
                         self.drag = Some(Drag::Draw { page: pi, pts: vec![pp] });
                     }
@@ -1474,6 +2035,15 @@ impl App {
                 Tool::Signature => {
                     if let Some((pi, pp)) = hit {
                         self.place_signature(pi, pp);
+                    }
+                }
+                Tool::Comment => {
+                    self.close_note();
+                    if let Some((pi, pp)) = hit {
+                        match self.doc.pages[pi].objects.iter().rposition(|o| matches!(o.kind, Kind::Note { .. }) && o.hit(pp, 2.0 / z)) {
+                            Some(k) => self.open_note(pi, k),
+                            None => self.place_note(pi, pp),
+                        }
                     }
                 }
                 Tool::Hand => {}
@@ -1500,6 +2070,11 @@ impl App {
                     self.clamp_scroll();
                 }
                 Drag::VScroll { .. } => {}
+                Drag::PenPull { page } | Drag::Freeform { page, .. } | Drag::PathPoint { page, .. } => {
+                    if let Some(pp) = pp_of(*page) {
+                        self.pen_drag(pp);
+                    }
+                }
                 Drag::Move { page, idx, start, orig, moved, .. } => {
                     if let Some(pp) = pp_of(*page) {
                         let d = pp - *start;
@@ -1526,12 +2101,22 @@ impl App {
                         *cur = pp;
                     }
                 }
+                Drag::RPaint { .. } | Drag::RSelect { .. } | Drag::RLasso { .. } | Drag::RCrop { .. } | Drag::RGradient { .. } => {
+                    if let Some(p) = pointer {
+                        self.raster_drag(rects, p);
+                    }
+                }
             }
         }
         if released || !any_down {
             let drag = self.drag.take().expect("drag");
             match drag {
                 Drag::Move { before, moved: true, .. } | Drag::Resize { before, .. } => self.doc.push_undo(before),
+                Drag::Move { page, idx, moved: false, .. } => {
+                    if matches!(self.doc.pages.get(page).and_then(|p| p.objects.get(idx)).map(|o| &o.kind), Some(Kind::Note { .. })) {
+                        self.open_note(page, idx);
+                    }
+                }
                 Drag::Draw { page, pts } => {
                     let (hl, color, width) = self.ink_style();
                     let (rect, unit) = ink_from_points(&[pts], width / 2.0);
@@ -1553,6 +2138,8 @@ impl App {
                         self.sel = Some((page, self.doc.pages[page].objects.len() - 1));
                     }
                 }
+                d @ (Drag::Freeform { .. } | Drag::PathPoint { .. }) => self.pen_release(d),
+                d @ (Drag::RPaint { .. } | Drag::RSelect { .. } | Drag::RLasso { .. } | Drag::RCrop { .. } | Drag::RGradient { .. }) => self.raster_release(d),
                 _ => {}
             }
         }
@@ -1743,6 +2330,8 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         self.receive_renders(&ctx);
+        self.raster_housekeeping();
+        self.two_cols = Self::tool_columns_needed(ctx.content_rect().height() - 110.0);
 
         if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.doc.dirty {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
@@ -1751,7 +2340,8 @@ impl eframe::App for App {
         if self.allow_close {
             ctx.send_viewport_cmd(egui::ViewportCommand::Close);
         }
-        if self.pending.is_none() && self.sig_pad.is_none() && self.error.is_none() {
+        let modal = self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some();
+        if self.pending.is_none() && self.sig_pad.is_none() && self.error.is_none() && !modal {
             self.shortcuts(&ctx);
         }
 
@@ -1759,18 +2349,31 @@ impl eframe::App for App {
         egui::Panel::top("menu").frame(bar(t.chrome)).show(ui, |ui| self.menu_bar(ui));
         egui::Panel::top("options").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).exact_size(36.0).show(ui, |ui| self.options_bar(ui));
         egui::Panel::bottom("status").frame(bar(t.chrome)).exact_size(26.0).show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("tools").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(42.0).resizable(false).show(ui, |ui| self.tool_column(ui));
+        egui::Panel::left("tools").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(if self.two_cols { 72.0 } else { 42.0 }).resizable(false).show(ui, |ui| self.tool_column(ui));
         egui::Panel::right("dock")
             .frame(egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(4, 0)))
             .default_size(250.0)
             .size_range(200.0..=380.0)
             .show(ui, |ui| self.dock(ui));
-        egui::CentralPanel::no_frame().show(ui, |ui| self.canvas(ui));
+        egui::CentralPanel::no_frame().show(ui, |ui| {
+            self.sig_banner(ui);
+            let r = ui.available_rect_before_wrap();
+            let mut c = ui.new_child(egui::UiBuilder::new().max_rect(r));
+            self.canvas(&mut c);
+        });
+        self.pen_flyout(&ctx);
+        if self.grid {
+            self.close_note();
+        } else {
+            let rects = self.page_rects();
+            self.note_popup(&ctx, &rects);
+        }
         self.dialogs(&ctx);
+        self.sign_dialogs(&ctx);
 
         self.debug_screenshot(&ctx);
 
-        let title = format!("{}{} — PDF Editor", self.doc.title(), if self.doc.dirty { " •" } else { "" });
+        let title = format!("{}{} — PDFflow", self.doc.title(), if self.doc.dirty { " •" } else { "" });
         if title != self.last_title {
             ctx.send_viewport_cmd(egui::ViewportCommand::Title(title.clone()));
             self.last_title = title;
@@ -1790,20 +2393,118 @@ impl App {
         self.sigs = s;
         self.sig_sel = 0;
     }
+    pub(crate) fn grid_on(&self) -> bool {
+        self.grid
+    }
+    pub(crate) fn pen_drafting(&self) -> bool {
+        self.pen.is_some()
+    }
+    pub(crate) fn flyout_open(&self) -> bool {
+        self.flyout.is_some()
+    }
+    pub(crate) fn has_pixel_selection(&self) -> bool {
+        self.pix_sel.is_some()
+    }
+    pub(crate) fn opts_color_for_test(&mut self, c: Color32) {
+        self.opts.color = c;
+    }
+    pub(crate) fn brush_color(&self) -> Color32 {
+        self.opts.color
+    }
+    pub(crate) fn select(&mut self, page: usize, idx: usize) {
+        self.sel = Some((page, idx));
+    }
+    pub(crate) fn add_test_id(&mut self, file: PathBuf) {
+        self.ids.push(crate::sig::IdEntry { file, name: "Test".into(), detail: String::new() });
+    }
+    pub(crate) fn signature_reports(&self) -> &[crate::dsig::SigReport] {
+        &self.sig_reports
+    }
+    pub(crate) fn try_save(&mut self) -> bool {
+        self.save(false)
+    }
+    pub(crate) fn unsign_prompt(&self) -> bool {
+        self.confirm_unsign.is_some()
+    }
+    pub(crate) fn open_file(&mut self, p: PathBuf) {
+        self.open_path(p);
+    }
+    pub(crate) fn note_open(&self) -> bool {
+        self.note_edit.is_some()
+    }
     pub(crate) fn rendered_counts(&self) -> (usize, usize) {
         (self.page_tex.len(), self.thumbs.len())
     }
 }
 
 impl App {
-    /// `PDFEDITOR_SHOT=out.png` saves a window capture after start-up and quits (for checks).
+    /// `PDFFLOW_SHOT=out.png` saves a window capture after start-up and quits (for checks).
     fn debug_screenshot(&mut self, ctx: &egui::Context) {
-        let Some(path) = std::env::var_os("PDFEDITOR_SHOT") else { return };
+        let Some(path) = std::env::var_os("PDFFLOW_SHOT") else { return };
         self.frames += 1;
-        if self.frames == 90 {
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_GRID").is_some() {
+            self.toggle_grid();
+        }
+        if self.frames == 5 {
+            if let Some(pic) = std::env::var_os("PDFFLOW_SHOT_PICTURE") {
+                if let Ok(b) = std::fs::read(pic) {
+                    let objs = &mut self.doc.pages[0].objects;
+                    let (rect, unit) = ink_from_points(&[vec![pos2(38.0, 173.0), pos2(413.0, 173.0)]], 7.0);
+                    objs.push(Obj { rect, kind: Kind::Ink { strokes: Arc::new(unit), color: Color32::from_rgb(255, 220, 0), width: 14.0, highlighter: true } });
+                    let mut note = Obj {
+                        rect: Rect::from_min_size(pos2(205.0, 140.0), vec2(1.0, 1.0)),
+                        kind: Kind::Text { text: "Key reference · อ่านแล้ว".into(), size: 13.0, color: Color32::from_rgb(200, 30, 30), bold: true },
+                    };
+                    note.refit_text();
+                    objs.push(note);
+                    self.insert_image(ctx, b, 0, Some(pos2(300.0, 330.0)));
+                    self.set_tool(Tool::Marquee);
+                    if let Some((p, i, _)) = self.picture_sel() {
+                        if self.ensure_live_for_test(ctx) {
+                            let l = self.rlive.as_ref().expect("live");
+                            let (w, h) = (l.raster.w as f32, l.raster.h as f32);
+                            self.pix_sel = Some(PixSel { page: p, idx: i, shape: rtools::SelShape::Rect(Rect::from_min_max(pos2(w * 0.3, h * 0.25), pos2(w * 0.7, h * 0.75))) });
+                        }
+                    }
+                }
+            }
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_NOTE").is_some() {
+            self.set_tool(Tool::Comment);
+            self.dock_tabs[1] = 1;
+            self.place_note(0, pos2(470.0, 150.0));
+            if let Some(Obj { kind: Kind::Note { text, .. }, .. }) = self.doc.pages[0].objects.last_mut() {
+                *text = "Please cite the original hypoplastic model here.\nตรวจสอบสมการที่ 3 อีกครั้ง".into();
+            }
+            self.close_note();
+            self.place_note(0, pos2(40.0, 330.0));
+            if let Some(Obj { kind: Kind::Note { text, color, .. }, .. }) = self.doc.pages[0].objects.last_mut() {
+                *text = "Good abstract.".into();
+                *color = notes::NOTE_COLORS[1];
+            }
+            self.close_note();
+            self.open_note(0, 0);
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_SIGS").is_some() {
+            self.sig_panel = true;
+            self.dock_tabs[2] = 1;
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_PEN").is_some() {
+            use crate::path::Node;
+            let pts = [pos2(330.0, 130.0), pos2(470.0, 190.0), pos2(420.0, 330.0), pos2(300.0, 300.0)];
+            let mut nodes: Vec<Node> = pts.iter().map(|p| Node::corner(*p)).collect();
+            crate::path::auto_smooth(&mut nodes, &[false, false, true, false], true);
+            let mut o = Obj { rect: Rect::NOTHING, kind: Kind::Path { nodes: Arc::new(vec![]), closed: true, stroke: Color32::from_rgb(200, 30, 30), fill: Some(Color32::from_rgba_unmultiplied(255, 220, 0, 255)), width: 2.0 } };
+            o.set_path_abs(&nodes, true);
+            self.doc.pages[0].objects.push(o);
+            self.sel = Some((0, self.doc.pages[0].objects.len() - 1));
+            self.set_tool(Tool::CurvaturePen);
+        }
+        let at: u32 = std::env::var("PDFFLOW_SHOT_FRAME").ok().and_then(|v| v.parse().ok()).unwrap_or(90);
+        if self.frames == at {
             ctx.send_viewport_cmd(egui::ViewportCommand::Screenshot(egui::UserData::default()));
         }
-        if self.frames < 200 {
+        if self.frames < at + 110 {
             ctx.request_repaint();
         }
         let shot = ctx.input(|i| {
@@ -1850,6 +2551,63 @@ fn quantize(scale: f32) -> f32 {
     2f32.powf((scale.max(0.01).log2() * 4.0).round() / 4.0)
 }
 
+/// Paint a Bezier path given in page points; `ts` maps page points to the screen.
+fn paint_path(painter: &egui::Painter, abs: &[crate::path::Node], closed: bool, stroke: Color32, fill: Option<Color32>, width: f32, z: f32, ts: impl Fn(Pos2) -> Pos2) {
+    let mut pts: Vec<Pos2> = crate::path::flatten(abs, closed, 24).into_iter().map(&ts).collect();
+    if closed && pts.len() > 2 && (pts[0] - pts[pts.len() - 1]).length() < 1e-3 {
+        pts.pop();
+    }
+    if pts.len() < 2 {
+        return;
+    }
+    if let (Some(f), true) = (fill, closed) {
+        let mut mesh = egui::Mesh::default();
+        for p in &pts {
+            mesh.colored_vertex(*p, f);
+        }
+        mesh.indices = crate::path::triangulate(&pts);
+        painter.add(Shape::mesh(mesh));
+    }
+    if width > 0.0 {
+        let st = Stroke::new((width * z).max(0.5), stroke);
+        painter.add(if closed { Shape::closed_line(pts, st) } else { Shape::line(pts, st) });
+    }
+}
+
+/// Draw a page thumbnail into `r`: the rendered page (requested when missing or too coarse)
+/// with the placed objects on top.
+fn paint_thumb(
+    painter: &egui::Painter,
+    page: &PageEntry,
+    r: Rect,
+    ppp: f32,
+    thumbs: &HashMap<usize, (f32, TextureHandle)>,
+    want: &mut Vec<Job>,
+    seen: &mut HashSet<usize>,
+) {
+    painter.rect_filled(r, 0.0, Color32::WHITE);
+    let vs = page.view_size();
+    if let PageSrc::Original(src) = page.src {
+        seen.insert(src);
+        let need = quantize(clamp_scale(page.size, r.width() * ppp / vs.x));
+        let have = thumbs.get(&src);
+        if let Some((_, tex)) = have {
+            paint_page_texture(painter, page, r, tex);
+        }
+        if have.is_none_or(|(s, _)| *s < need * 0.7) {
+            let job = Job { page: src, scale: need, thumb: true };
+            if !want.contains(&job) {
+                want.push(job);
+            }
+        }
+    }
+    let clip = painter.with_clip_rect(r.intersect(painter.clip_rect()));
+    let z = r.width() / vs.x;
+    for o in &page.objects {
+        paint_obj(&clip, page, r.min, z, o);
+    }
+}
+
 /// Draw a rendered page texture into its view rect, rotated by the editor's page rotation.
 fn paint_page_texture(painter: &egui::Painter, page: &PageEntry, view: Rect, tex: &TextureHandle) {
     let z = view.width() / page.view_size().x;
@@ -1882,6 +2640,9 @@ fn set_line(o: &mut Obj, pa: Pos2, pb: Pos2) {
 
 /// Resize handles in page points: line end points, corners only for text, else 8 handles.
 fn handles(o: &Obj) -> Vec<(usize, Pos2)> {
+    if matches!(o.kind, Kind::Note { .. }) {
+        return Vec::new();
+    }
     if let Kind::Shape { shape: ShapeKind::Line | ShapeKind::Arrow, a, b, .. } = &o.kind {
         return vec![(0, o.at(*a)), (1, o.at(*b))];
     }
@@ -1954,6 +2715,17 @@ fn resize(orig: &Obj, h: usize, p: Pos2, shift: bool) -> Obj {
     o
 }
 
+/// Draw a picture texture into its object rect (rotated with the page).
+fn paint_image(painter: &egui::Painter, page: &PageEntry, origin: Pos2, z: f32, r: Rect, tex: egui::TextureId) {
+    let ts = |p: Pos2| origin + page.to_view(p).to_vec2() * z;
+    let mut mesh = egui::Mesh::with_texture(tex);
+    for (p, uv) in [(r.left_top(), pos2(0.0, 0.0)), (r.right_top(), pos2(1.0, 0.0)), (r.right_bottom(), pos2(1.0, 1.0)), (r.left_bottom(), pos2(0.0, 1.0))] {
+        mesh.vertices.push(egui::epaint::Vertex { pos: ts(p), uv, color: Color32::WHITE });
+    }
+    mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
+    painter.add(Shape::mesh(mesh));
+}
+
 /// Paint one placed object; `origin` is the page's top-left on screen and `z` the zoom.
 pub fn paint_obj(painter: &egui::Painter, page: &PageEntry, origin: Pos2, z: f32, obj: &Obj) {
     let ts = |p: Pos2| origin + page.to_view(p).to_vec2() * z;
@@ -1976,13 +2748,9 @@ pub fn paint_obj(painter: &egui::Painter, page: &PageEntry, origin: Pos2, z: f32
             }
         }
         Kind::Image(img) => {
-            let r = obj.rect;
-            let mut mesh = egui::Mesh::with_texture(img.tex.id());
-            for (p, uv) in [(r.left_top(), pos2(0.0, 0.0)), (r.right_top(), pos2(1.0, 0.0)), (r.right_bottom(), pos2(1.0, 1.0)), (r.left_bottom(), pos2(0.0, 1.0))] {
-                mesh.vertices.push(egui::epaint::Vertex { pos: ts(p), uv, color: Color32::WHITE });
+            if let Some(tex) = img.texture(painter.ctx()) {
+                paint_image(painter, page, origin, z, obj.rect, tex.id());
             }
-            mesh.indices.extend_from_slice(&[0, 1, 2, 0, 2, 3]);
-            painter.add(Shape::mesh(mesh));
         }
         Kind::Ink { strokes, color, width, highlighter } => {
             let c = if *highlighter { Color32::from_rgba_unmultiplied(color.r(), color.g(), color.b(), 110) } else { *color };
@@ -1995,6 +2763,13 @@ pub fn paint_obj(painter: &egui::Painter, page: &PageEntry, origin: Pos2, z: f32
                     painter.add(Shape::line(pts, Stroke::new(w, c)));
                 }
             }
+        }
+        Kind::Note { color, .. } => {
+            notes::paint_note_icon(painter, screen_rect(page, origin, z, obj.rect), *color);
+        }
+        Kind::Path { stroke, fill, width, .. } => {
+            let (abs, closed) = obj.path_abs().unwrap_or_default();
+            paint_path(painter, &abs, closed, *stroke, *fill, *width, z, ts);
         }
         Kind::Shape { shape, stroke, fill, width, a, b } => {
             let st = Stroke::new(if *width > 0.0 { (width * z).max(0.5) } else { 0.0 }, *stroke);

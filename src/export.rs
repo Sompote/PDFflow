@@ -62,6 +62,47 @@ pub fn save(doc: &Doc) -> Res<Vec<u8>> {
         page.set("Parent", root_pages);
         page.set("Rotate", ((base_rot + entry.rotation) % 360) as i64);
 
+        // Comments become Text annotations; the source's own comments were imported into the
+        // editor, so they are replaced rather than duplicated.
+        let notes: Vec<&crate::doc::Obj> = entry.objects.iter().filter(|o| matches!(o.kind, Kind::Note { .. })).collect();
+        let old_annots: Vec<Object> = match page.get(b"Annots") {
+            Ok(o) => match pdf.dereference(o) {
+                Ok((_, Object::Array(a))) => a.clone(),
+                _ => Vec::new(),
+            },
+            Err(_) => Vec::new(),
+        };
+        let kept: Vec<Object> = old_annots.iter().filter(|a| !is_comment_annot(&pdf, a)).cloned().collect();
+        if kept.len() != old_annots.len() || !notes.is_empty() {
+            let m = display_matrix(display_box, base_rot);
+            let mut annots = kept;
+            for (k, o) in notes.iter().enumerate() {
+                let Kind::Note { text, author, date, color } = &o.kind else { continue };
+                let r = rect_to_user(m, [o.rect.min.x, o.rect.min.y, o.rect.max.x, o.rect.max.y]);
+                let c = |v: u8| Object::Real(v as f32 / 255.0);
+                let id = pdf.add_object(dictionary! {
+                    "Type" => "Annot",
+                    "Subtype" => "Text",
+                    "Rect" => rect_obj(r),
+                    "Contents" => Object::String(pdf_text(text), StringFormat::Literal),
+                    "T" => Object::String(pdf_text(author), StringFormat::Literal),
+                    "M" => Object::String(date.as_bytes().to_vec(), StringFormat::Literal),
+                    "CreationDate" => Object::String(date.as_bytes().to_vec(), StringFormat::Literal),
+                    "NM" => Object::String(format!("pdfflow-{}-{k}", kids.len()).into_bytes(), StringFormat::Literal),
+                    "Name" => "Comment",
+                    "C" => vec![c(color.r()), c(color.g()), c(color.b())],
+                    "F" => 28,
+                    "Open" => false,
+                });
+                annots.push(Object::Reference(id));
+            }
+            if annots.is_empty() {
+                page.remove(b"Annots");
+            } else {
+                page.set("Annots", annots);
+            }
+        }
+
         if !entry.objects.is_empty() {
             let mut res = match page.get(b"Resources") {
                 Ok(Object::Dictionary(d)) => d.clone(),
@@ -114,19 +155,13 @@ struct Writer {
 
 impl Writer {
     fn overlay(&mut self, pdf: &mut Document, res: &mut Dictionary, entry: &crate::doc::PageEntry, b: [f32; 4], rot: u16) -> Res<Vec<u8>> {
-        let [x0, y0, x1, y1] = b;
-        // Display space (top-left origin, y down, page /Rotate applied) to PDF user space.
-        let m = match rot {
-            90 => [0.0, 1.0, 1.0, 0.0, x0, y0],
-            180 => [-1.0, 0.0, 0.0, 1.0, x1, y0],
-            270 => [0.0, -1.0, -1.0, 0.0, x1, y1],
-            _ => [1.0, 0.0, 0.0, -1.0, x0, y1],
-        };
+        let m = display_matrix(b, rot);
         let mut s = String::new();
         let _ = writeln!(s, "{} {} {} {} {} {} cm", m[0], m[1], m[2], m[3], n(m[4]), n(m[5]));
         for (k, obj) in entry.objects.iter().enumerate() {
             let r = obj.rect;
             match &obj.kind {
+                Kind::Note { .. } => {}
                 Kind::Text { text, size, color, bold } => {
                     let fi = *bold as usize;
                     let fid = *self.font_ids[fi].get_or_insert_with(|| pdf.new_object_id());
@@ -179,6 +214,27 @@ impl Writer {
                         s.push_str("S\n");
                     }
                     s.push_str("Q\n");
+                }
+                Kind::Path { stroke, fill, width, .. } => {
+                    let (abs, closed) = obj.path_abs().unwrap_or_default();
+                    let _ = write!(s, "q 1 j 1 J {} RG {} w ", rgb(*stroke), n(*width));
+                    if let Some(f) = fill {
+                        let _ = write!(s, "{} rg ", rgb(*f));
+                    }
+                    if let Some(first) = abs.first() {
+                        let _ = write!(s, "{} {} m ", n(first.p.x), n(first.p.y));
+                    }
+                    for (_, c) in crate::path::segments(&abs, closed) {
+                        let _ = write!(s, "{} {} {} {} {} {} c ", n(c[1].x), n(c[1].y), n(c[2].x), n(c[2].y), n(c[3].x), n(c[3].y));
+                    }
+                    let paint = match (fill.is_some() && closed, *width > 0.0) {
+                        (true, true) => "b",
+                        (true, false) => "f",
+                        (false, true) if closed => "s",
+                        (false, true) => "S",
+                        (false, false) => "n",
+                    };
+                    let _ = writeln!(s, "{paint} Q");
                 }
                 Kind::Shape { shape, stroke, fill, width, a, b } => {
                     let _ = write!(s, "q 1 j {} RG {} w ", rgb(*stroke), n(*width));
@@ -283,6 +339,53 @@ impl Writer {
     }
 }
 
+/// Display space (top-left origin, y down, the page's /Rotate applied) to PDF user space, as a
+/// `cm` matrix [a b c d e f] for the visible box `b` and rotation `rot`.
+pub(crate) fn display_matrix(b: [f32; 4], rot: u16) -> [f32; 6] {
+    let [x0, y0, x1, y1] = b;
+    match rot {
+        90 => [0.0, 1.0, 1.0, 0.0, x0, y0],
+        180 => [-1.0, 0.0, 0.0, 1.0, x1, y0],
+        270 => [0.0, -1.0, -1.0, 0.0, x1, y1],
+        _ => [1.0, 0.0, 0.0, -1.0, x0, y1],
+    }
+}
+
+/// A display-space rect in user space.
+pub(crate) fn rect_to_user(m: [f32; 6], r: [f32; 4]) -> [f32; 4] {
+    let t = |u: f32, v: f32| (m[0] * u + m[2] * v + m[4], m[1] * u + m[3] * v + m[5]);
+    let (ax, ay) = t(r[0], r[1]);
+    let (bx, by) = t(r[2], r[3]);
+    [ax.min(bx), ay.min(by), ax.max(bx), ay.max(by)]
+}
+
+/// A user-space point in display space (inverse of `display_matrix`).
+pub(crate) fn point_to_display(m: [f32; 6], x: f32, y: f32) -> (f32, f32) {
+    let det = m[0] * m[3] - m[1] * m[2];
+    let (dx, dy) = (x - m[4], y - m[5]);
+    ((m[3] * dx - m[2] * dy) / det, (-m[1] * dx + m[0] * dy) / det)
+}
+
+/// The visible box (crop ∩ media) and /Rotate of a page, with inheritance.
+pub(crate) fn page_frame(pdf: &Document, id: ObjectId) -> ([f32; 4], u16) {
+    let media = inherited(pdf, id, b"MediaBox").and_then(|o| rect_of(pdf, &o)).unwrap_or([0.0, 0.0, 595.0, 842.0]);
+    let crop = inherited(pdf, id, b"CropBox").and_then(|o| rect_of(pdf, &o));
+    let b = crop.map(|c| intersect(c, media)).filter(|b| b[2] > b[0] && b[3] > b[1]).unwrap_or(media);
+    let rot = inherited(pdf, id, b"Rotate").and_then(|o| o.as_i64().ok()).unwrap_or(0).rem_euclid(360) as u16 / 90 * 90;
+    (b, rot)
+}
+
+/// Is this annotation a comment (Text) or the pop-up of one? Those are replaced by the editor's
+/// comments when saving.
+pub(crate) fn is_comment_annot(pdf: &Document, o: &Object) -> bool {
+    let Ok((_, Object::Dictionary(d))) = pdf.dereference(o) else { return false };
+    match d.get(b"Subtype").and_then(Object::as_name) {
+        Ok(b"Text") => true,
+        Ok(b"Popup") => d.get(b"Parent").is_ok_and(|p| is_comment_annot(pdf, p)),
+        _ => false,
+    }
+}
+
 /// Arrow head for a line from `a` to `b`: [tip, left, right, where the shaft should stop].
 pub fn arrow_head(a: Pos2, b: Pos2, width: f32) -> Option<[Pos2; 4]> {
     let d = b - a;
@@ -295,6 +398,18 @@ pub fn arrow_head(a: Pos2, b: Pos2, width: f32) -> Option<[Pos2; 4]> {
     let base = b - u * size;
     let perp = eframe::egui::vec2(-u.y, u.x) * size * 0.5;
     Some([b, base + perp, base - perp, b - u * size * 0.6])
+}
+
+/// A PDF text string: PDFDocEncoding-compatible ASCII, else UTF-16BE with a byte-order mark.
+fn pdf_text(s: &str) -> Vec<u8> {
+    if s.is_ascii() {
+        return s.as_bytes().to_vec();
+    }
+    let mut out = vec![0xFE, 0xFF];
+    for u in s.encode_utf16() {
+        out.extend_from_slice(&u.to_be_bytes());
+    }
+    out
 }
 
 fn to_unicode(map: &BTreeMap<u16, String>) -> String {
@@ -316,7 +431,8 @@ fn to_unicode(map: &BTreeMap<u16, String>) -> String {
 
 fn image_xobject(pdf: &mut Document, img: &ImageData) -> Res<ObjectId> {
     let [w, h] = img.px;
-    if let Some(comps @ (1 | 3)) = jpeg_components(&img.bytes) {
+    let original = img.raster.is_none();
+    if let (true, Some(comps @ (1 | 3))) = (original, jpeg_components(&img.bytes)) {
         let mut st = Stream::new(
             dictionary! {
                 "Type" => "XObject", "Subtype" => "Image", "Width" => w as i64, "Height" => h as i64,
@@ -328,8 +444,8 @@ fn image_xobject(pdf: &mut Document, img: &ImageData) -> Res<ObjectId> {
         st.allows_compression = false;
         return Ok(pdf.add_object(st));
     }
-    let rgba = image::load_from_memory(&img.bytes).map_err(|e| format!("Cannot decode picture: {e}"))?.to_rgba8();
-    let (w, h) = rgba.dimensions();
+    let (w, h, data) = img.rgba().ok_or("Cannot decode picture")?;
+    let rgba = image::RgbaImage::from_raw(w, h, data).ok_or("Bad picture size")?;
     let mut rgb = Vec::with_capacity((w * h * 3) as usize);
     let mut alpha = Vec::with_capacity((w * h) as usize);
     for p in rgba.pixels() {
@@ -403,7 +519,7 @@ fn resolve_dict(pdf: &Document, o: &Object) -> Dictionary {
     }
 }
 
-fn inherited(pdf: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
+pub(crate) fn inherited(pdf: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
     for _ in 0..64 {
         let d = pdf.get_dictionary(id).ok()?;
         if let Ok(v) = d.get(key) {
@@ -414,7 +530,7 @@ fn inherited(pdf: &Document, mut id: ObjectId, key: &[u8]) -> Option<Object> {
     None
 }
 
-fn rect_of(pdf: &Document, o: &Object) -> Option<[f32; 4]> {
+pub(crate) fn rect_of(pdf: &Document, o: &Object) -> Option<[f32; 4]> {
     let (_, o) = pdf.dereference(o).ok()?;
     let a = o.as_array().ok()?;
     if a.len() != 4 {
@@ -427,7 +543,7 @@ fn rect_of(pdf: &Document, o: &Object) -> Option<[f32; 4]> {
     Some([v[0].min(v[2]), v[1].min(v[3]), v[0].max(v[2]), v[1].max(v[3])])
 }
 
-fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
+pub(crate) fn intersect(a: [f32; 4], b: [f32; 4]) -> [f32; 4] {
     [a[0].max(b[0]), a[1].max(b[1]), a[2].min(b[2]), a[3].min(b[3])]
 }
 

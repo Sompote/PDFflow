@@ -1,5 +1,5 @@
 [package]
-name = "pdfeditor"
+name = "pdfflow"
 version = "0.1.0"
 edition = "2024"
 description = "A small PDF editor with a Photoshop-style UI"
@@ -14,6 +14,18 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 skrifa = "0.44"
 harfrust = "0.12"
 flate2 = "1"
+# Digital signatures (pure Rust, one RustCrypto generation: der 0.7)
+cms = { version = "0.2", features = ["builder"] }
+x509-cert = { version = "0.2", features = ["builder"] }
+p12-keystore = "0.2"
+rsa = { version = "0.9", features = ["sha2"] }
+p256 = { version = "0.13", features = ["ecdsa", "pkcs8"] }
+sha2 = "0.10"
+der = "0.7"
+spki = "0.7"
+pkcs8 = "0.10"
+const-oid = { version = "0.9", features = ["db"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
 
 [profile.release]
 opt-level = 3
