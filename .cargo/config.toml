@@ -1,0 +1,3 @@
+# Windows builds link the C runtime statically, so pdfflow.exe needs no MinGW DLLs.
+[target.x86_64-pc-windows-gnu]
+rustflags = ["-C", "target-feature=+crt-static"]

@@ -21,6 +21,21 @@ selected with a marquee selection, so the picture tools in the two-column tool b
 and the Layers panel lists all three objects. Picture: <i>The Great Wave off Kanagawa</i>,
 Katsushika Hokusai, c. 1831, public domain.</sub>
 
+## Download
+
+**Version 0.1.0** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.0)):
+
+| Platform | File |
+|---|---|
+| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.0-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.0/PDFflow-0.1.0-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.0/PDFflow-0.1.0-macOS-universal.zip) |
+| Windows 10 / 11, 64-bit | [PDFflow-0.1.0-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.0/PDFflow-0.1.0-windows-x64.zip) |
+
+The builds are not signed by Apple or Microsoft, so the first launch needs one extra step. On
+macOS, drag PDFflow to Applications, then right-click it and choose **Open** (or run
+`xattr -dr com.apple.quarantine /Applications/PDFflow.app`). On Windows, unzip the folder, run
+`PDFflow.exe`, and if SmartScreen appears choose **More info › Run anyway**. Checksums are in
+`SHA256SUMS.txt` on the release page.
+
 ## Features
 
 ### Reading and pages
@@ -139,6 +154,10 @@ JPEGs are embedded unchanged, and edited pictures are embedded with their new pi
 cargo build --release
 ./target/release/pdfflow [file.pdf]
 ```
+
+`tools/package.sh` builds the release files on macOS: a universal `PDFflow.app` (zip and dmg) and
+the Windows executable, cross-compiled with MinGW-w64 (`rustup target add aarch64-apple-darwin
+x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 
 ## Shortcuts
 
