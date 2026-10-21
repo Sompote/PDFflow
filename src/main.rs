@@ -8,6 +8,8 @@ mod dsig;
 mod export;
 mod icon_data;
 mod icons;
+#[cfg(target_os = "macos")]
+mod macopen;
 mod path;
 mod raster;
 mod render;
@@ -44,5 +46,9 @@ fn main() -> eframe::Result {
             .with_icon(app_icon()),
         ..Default::default()
     };
-    eframe::run_native("PDFflow", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, path)))))
+    let event_loop = winit::event_loop::EventLoop::<eframe::UserEvent>::with_user_event().build().map_err(eframe::Error::WinitEventLoop)?;
+    #[cfg(target_os = "macos")]
+    macopen::install();
+    let mut app = eframe::create_native("PDFflow", options, Box::new(|cc| Ok(Box::new(app::App::new(cc, path)))), &event_loop);
+    event_loop.run_app(&mut app).map_err(eframe::Error::WinitEventLoop)
 }

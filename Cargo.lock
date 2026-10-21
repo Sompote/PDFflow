@@ -2999,7 +2999,7 @@ dependencies = [
 
 [[package]]
 name = "pdfflow"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "cms",
  "const-oid",
@@ -3011,6 +3011,7 @@ dependencies = [
  "hayro",
  "image",
  "lopdf",
+ "objc2 0.5.3",
  "p12-keystore",
  "p256",
  "pkcs8",
@@ -3020,6 +3021,7 @@ dependencies = [
  "sha2",
  "skrifa 0.44.0",
  "spki",
+ "winit",
  "winresource",
  "x509-cert",
 ]

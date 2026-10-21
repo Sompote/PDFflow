@@ -299,6 +299,8 @@ impl App {
             trust_dlg: None,
             sign_placing: None,
         };
+        #[cfg(target_os = "macos")]
+        crate::macopen::set_context(&cc.egui_ctx);
         if let Some(p) = path {
             app.open_path(p);
         }
@@ -2385,6 +2387,11 @@ impl eframe::App for App {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         self.receive_renders(&ctx);
+        // A PDF double-clicked in Finder (or dropped on the Dock icon).
+        #[cfg(target_os = "macos")]
+        if let Some(p) = crate::macopen::take().pop() {
+            self.guarded(Pending::Open(Some(p)));
+        }
         self.raster_housekeeping();
         self.two_cols = Self::tool_columns_needed(ctx.content_rect().height() - 110.0);
 

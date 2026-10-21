@@ -1,6 +1,6 @@
 [package]
 name = "pdfflow"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 description = "A small PDF editor with a Photoshop-style UI"
 license = "MIT OR Apache-2.0"
@@ -14,6 +14,8 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 skrifa = "0.44"
 harfrust = "0.12"
 flate2 = "1"
+# The event loop is built here (not inside eframe) so macOS "open document" events can be hooked.
+winit = { version = "0.30", default-features = false }
 # Digital signatures (pure Rust, one RustCrypto generation: der 0.7)
 cms = { version = "0.2", features = ["builder"] }
 x509-cert = { version = "0.2", features = ["builder", "pem"] }
@@ -36,6 +38,9 @@ strip = true
 
 [profile.dev.package."*"]
 opt-level = 2
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.5"
 
 [build-dependencies]
 winresource = "0.1"
