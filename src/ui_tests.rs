@@ -692,3 +692,126 @@ fn drag_a_box_to_place_the_signature() {
     let rect: Vec<f32> = widget.get(b"Rect").unwrap().as_array().unwrap().iter().map(|v| v.as_float().unwrap()).collect();
     assert!((rect[0] - r.min.x).abs() < 0.5 && (rect[3] - (842.0 - r.min.y)).abs() < 0.5, "{rect:?}");
 }
+
+fn text_doc(name: &str) -> std::path::PathBuf {
+    let path = std::env::temp_dir().join(name);
+    std::fs::write(&path, crate::textlayer::tests::text_pdf()).unwrap();
+    path
+}
+
+#[test]
+fn select_text_by_dragging_double_click_and_mark_it_up() {
+    // Frames 1/60 s apart, so two clicks are quick enough to make a double-click.
+    let path = text_doc("pdfflow-select.pdf");
+    let mut h = Harness::builder().with_size(vec2(1280.0, 820.0)).with_step_dt(1.0 / 60.0).build_eframe(move |cc| App::new(cc, Some(path)));
+    h.run_steps(3);
+    h.key_press(Key::D);
+    h.step();
+    assert_eq!(h.state().tool, Tool::SelectText);
+    // "Hello world" sits on the baseline 92 pt from the top, from x = 72.
+    dragp(&mut h, pos2(70.0, 86.0), pos2(200.0, 86.0));
+    assert_eq!(h.state_mut().selected_text().as_deref(), Some("Hello world"));
+    // Double-click picks one word.
+    let w = at(&h, 0, pos2(80.0, 116.0));
+    h.hover_at(w);
+    h.step();
+    for _ in 0..2 {
+        h.event(Event::PointerButton { pos: w, button: eframe::egui::PointerButton::Primary, pressed: true, modifiers: Modifiers::NONE });
+        h.step();
+        h.event(Event::PointerButton { pos: w, button: eframe::egui::PointerButton::Primary, pressed: false, modifiers: Modifiers::NONE });
+        h.step();
+    }
+    h.run_steps(2);
+    assert_eq!(h.state_mut().selected_text().as_deref(), Some("Soil"));
+    // Highlight the word: one highlighter object over it, one undo step.
+    let n = h.state_mut().markup_selection(crate::app::Markup::Highlight, eframe::egui::Color32::YELLOW);
+    assert_eq!(n, 1);
+    let o = &h.state().doc.pages[0].objects[0];
+    assert!(matches!(o.kind, Kind::Ink { highlighter: true, .. }));
+    assert!(o.rect.min.x < 73.0 && o.rect.max.x > 104.0 && o.rect.max.x < 112.0 && o.rect.min.y < 115.0 && o.rect.max.y > 120.0, "{:?}", o.rect);
+    undo(&mut h);
+    assert!(h.state().doc.pages[0].objects.is_empty());
+    // ⌘A selects the page; Escape clears it.
+    h.key_press_modifiers(Modifiers::COMMAND, Key::A);
+    h.step();
+    assert_eq!(h.state_mut().selected_text().as_deref(), Some("Hello world\nSoil mechanics"));
+    h.key_press(Key::Escape);
+    h.step();
+    assert!(h.state_mut().selected_text().is_none());
+}
+
+#[test]
+fn snapshot_copies_an_area_and_pastes_it_as_a_picture() {
+    let mut h = harness(None);
+    h.key_press(Key::R);
+    h.step();
+    dragp(&mut h, pos2(100.0, 100.0), pos2(200.0, 160.0));
+    h.state_mut().set_tool(Tool::Snapshot);
+    h.step();
+    dragp(&mut h, pos2(90.0, 90.0), pos2(234.0, 162.0));
+    // 144 × 72 pt at 150 dpi.
+    let (w, ht) = h.state().snapshot_size().expect("a snapshot");
+    assert!((w as i32 - 300).abs() <= 3 && (ht as i32 - 150).abs() <= 3, "{w}×{ht}");
+    assert!(h.state().clipboard_is_picture());
+    h.key_press_modifiers(Modifiers::COMMAND, Key::V);
+    h.event(Event::Paste(String::new()));
+    h.run_steps(2);
+    let objs = &h.state().doc.pages[0].objects;
+    let pic = objs.iter().find(|o| matches!(o.kind, Kind::Image(_))).expect("pasted picture");
+    // It lands on the area it was taken from.
+    assert!((pic.rect.min - pos2(90.0, 90.0)).length() < 2.0 && (pic.rect.size() - vec2(144.0, 72.0)).length() < 2.0, "{:?}", pic.rect);
+}
+
+#[test]
+fn an_agent_edits_through_the_mcp_tools() {
+    use serde_json::json;
+    let src = text_doc("pdfflow-agent-in.pdf");
+    let out = std::env::temp_dir().join("pdfflow-agent-out.pdf");
+    let mut h = harness(Some(src));
+    let ctx = h.ctx.clone();
+    let call = |h: &mut Harness<'_, App>, name: &str, args: serde_json::Value| {
+        let r = h.state_mut().agent_call(&ctx, name, &args);
+        h.run_steps(1);
+        r
+    };
+    let found = call(&mut h, "find_text", json!({"query": "soil mechanics"})).unwrap();
+    assert_eq!(found["count"], 1);
+    assert_eq!(found["matches"][0]["page"], 1);
+    let marked = call(&mut h, "markup_text", json!({"style": "underline", "query": "world", "color": "red"})).unwrap();
+    assert_eq!(marked["objects_added"], 1);
+    let added = call(&mut h, "add_text", json!({"page": 1, "x": 72, "y": 200, "text": "Reviewed ตรวจแล้ว", "size": 16, "color": "#1e50dc"})).unwrap();
+    assert_eq!(added["index"], 1);
+    call(&mut h, "add_shape", json!({"page": 1, "shape": "arrow", "from": [300, 300], "to": [200, 210]})).unwrap();
+    call(&mut h, "add_comment", json!({"page": 1, "x": 400, "y": 80, "text": "Check this line"})).unwrap();
+    let listed = call(&mut h, "list_objects", json!({"page": 1})).unwrap();
+    let types: Vec<&str> = listed["objects"].as_array().unwrap().iter().map(|o| o["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["line", "text", "arrow", "comment"]);
+    call(&mut h, "update_object", json!({"page": 1, "index": 1, "size": 20, "bold": true})).unwrap();
+    assert!(call(&mut h, "update_object", json!({"page": 1, "index": 9})).unwrap_err().contains("no object 9"));
+    assert!(call(&mut h, "go_to_page", json!({"page": 5})).unwrap_err().contains("1 page"));
+    // Pages.
+    call(&mut h, "insert_blank_page", json!({"after": 1})).unwrap();
+    call(&mut h, "rotate_page", json!({"page": 2, "degrees": -90})).unwrap();
+    assert_eq!(h.state().doc.pages[1].rotation, 270);
+    call(&mut h, "move_page", json!({"page": 2, "to": 1})).unwrap();
+    assert_eq!(h.state().doc.pages[0].src, crate::doc::PageSrc::Blank);
+    call(&mut h, "undo", json!({})).unwrap();
+    assert_eq!(h.state().doc.pages[1].src, crate::doc::PageSrc::Blank);
+    call(&mut h, "delete_page", json!({"page": 2})).unwrap();
+    // Look at the page, then take a snapshot of the arrow's area.
+    let shot = call(&mut h, "render_page", json!({"page": 1, "dpi": 50})).unwrap();
+    assert!(shot["image_png"].as_str().unwrap().len() > 100);
+    assert!((shot["width"].as_i64().unwrap() - 425).abs() <= 1, "{}", shot["width"]);
+    let snap = call(&mut h, "snapshot", json!({"page": 1, "rect": [190, 200, 310, 310], "dpi": 72, "return_image": false})).unwrap();
+    assert_eq!((snap["width"].as_u64(), snap["height"].as_u64()), (Some(120), Some(110)));
+    call(&mut h, "paste", json!({"page": 1, "x": 450, "y": 600})).unwrap();
+    // Save, reopen and read the typed text back from the PDF.
+    let saved = call(&mut h, "save_pdf", json!({"path": out.to_string_lossy()})).unwrap();
+    assert!(saved["bytes"].as_u64().unwrap() > 1000);
+    call(&mut h, "open_pdf", json!({"path": out.to_string_lossy()})).unwrap();
+    let text = call(&mut h, "get_text", json!({})).unwrap();
+    let t = text["pages"][0]["text"].as_str().unwrap();
+    assert!(t.contains("Hello world") && t.contains("Reviewed ตรวจแล้ว"), "{t}");
+    let comments = call(&mut h, "list_comments", json!({})).unwrap();
+    assert_eq!(comments["comments"][0]["text"], "Check this line");
+}

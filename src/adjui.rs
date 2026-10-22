@@ -443,6 +443,21 @@ impl App {
         }
     }
 
+    /// Apply `adj` to the whole of picture `idx` on `page` as one undo step (for agents).
+    pub(crate) fn apply_adjustment(&mut self, ctx: &egui::Context, page: usize, idx: usize, adj: &Adj) -> Result<(), String> {
+        if self.adjust_dlg.is_some() {
+            return Err("An adjustment dialog is open in the window; close it first.".into());
+        }
+        if !self.ensure_live(ctx, page, idx) {
+            return Err("The picture cannot be decoded for editing.".into());
+        }
+        let orig = self.rlive.as_ref().expect("live").raster.clone();
+        let before = self.doc.pages.clone();
+        self.set_live(render(&orig, adj, None));
+        self.commit_live(before);
+        Ok(())
+    }
+
     pub(crate) fn adjusting(&self) -> bool {
         self.adjust_dlg.is_some()
     }

@@ -184,3 +184,39 @@ fn closed_filled_path_round_trip() {
     assert!(is_red(px(&img, 200.0, 160.0)));
     assert!(is_white(px(&img, 120.0, 250.0)));
 }
+
+/// Every object a saved file holds is listed in its cross-reference stream (lopdf's
+/// object-stream writer used to leave some out, which Poppler and Acrobat reject).
+#[test]
+fn saved_cross_reference_stream_lists_every_object() {
+    let mut d = Document::with_version("1.7");
+    let pages = d.new_object_id();
+    let mut kids = Vec::new();
+    for k in 0..40 {
+        let content = d.add_object(Stream::new(dictionary! {}, format!("0 0 1 rg {} 60 20 20 re f", 20 + k).into_bytes()));
+        kids.push(Object::Reference(d.add_object(dictionary! { "Type" => "Page", "Parent" => pages, "Contents" => content })));
+    }
+    d.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => kids, "Count" => 40, "MediaBox" => vec![0.into(), 0.into(), 600.into(), 800.into()] }));
+    let cat = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    d.trailer.set("Root", cat);
+    let mut src = Vec::new();
+    d.save_to(&mut src).unwrap();
+    let mut doc = Doc::from_pdf(None, Arc::new(src), &vec![vec2(600.0, 800.0); 40]);
+    doc.pages[3].objects.push(red_box(Rect::from_min_size(pos2(100.0, 100.0), vec2(50.0, 50.0))));
+    let out = export::save(&doc).unwrap();
+    // One character per byte, so offsets in the text are offsets in the file.
+    let text: String = out.iter().map(|&b| if b.is_ascii() { b as char } else { '?' }).collect();
+    let ids: Vec<i64> = text.match_indices(" 0 obj").filter_map(|(i, _)| text[..i].rsplit(|c: char| !c.is_ascii_digit()).next()?.parse().ok()).collect();
+    let at = text.rfind("startxref").unwrap();
+    let start: usize = text[at + 9..].trim().lines().next().unwrap().parse().unwrap();
+    let head = &text[start..start + 400];
+    let index = &head[head.find("/Index[").unwrap() + 7..];
+    let nums: Vec<i64> = index[..index.find(']').unwrap()].split_whitespace().map(|n| n.parse().unwrap()).collect();
+    let listed = |id: i64| nums.chunks(2).any(|c| id >= c[0] && id < c[0] + c[1]);
+    assert!(ids.len() > 40);
+    for id in ids {
+        assert!(listed(id), "object {id} is missing from the cross-reference stream {nums:?}");
+    }
+    assert_eq!(render(&out, 3).0, 600);
+}
+

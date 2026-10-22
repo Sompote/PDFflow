@@ -1,6 +1,6 @@
 [package]
 name = "pdfflow"
-version = "0.1.2"
+version = "0.1.3"
 edition = "2024"
 description = "A small PDF editor with a Photoshop-style UI"
 license = "AGPL-3.0-or-later"
@@ -14,6 +14,11 @@ rfd = { version = "0.15", default-features = false, features = ["xdg-portal", "a
 skrifa = "0.44"
 harfrust = "0.12"
 flate2 = "1"
+# Glyph geometry from hayro's interpreter (the version hayro itself uses).
+kurbo = "0.13"
+# The MCP server (JSON-RPC) and its PNG image results.
+serde_json = "1"
+base64 = "0.22"
 # The event loop is built here (not inside eframe) so macOS "open document" events can be hooked.
 winit = { version = "0.30", default-features = false }
 # Digital signatures (pure Rust, one RustCrypto generation: der 0.7)

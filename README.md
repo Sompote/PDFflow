@@ -24,12 +24,12 @@ Katsushika Hokusai, c. 1831, public domain.</sub>
 
 ## Download
 
-**Version 0.1.2** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.2)):
+**Version 0.1.3** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.3)):
 
 | Platform | File |
 |---|---|
-| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.2-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-macOS-universal.zip) |
-| Windows 10 / 11, 64-bit | [PDFflow-0.1.2-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.2/PDFflow-0.1.2-windows-x64.zip) |
+| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.3-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-macOS-universal.zip) |
+| Windows 10 / 11, 64-bit | [PDFflow-0.1.3-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-windows-x64.zip) |
 
 The builds are not signed by Apple or Microsoft, so the first launch needs one extra step. On
 macOS, drag PDFflow to Applications, then right-click it and choose **Open** (or run
@@ -66,6 +66,25 @@ with handles, restack, copy, paste, duplicate and delete, with undo and redo for
 | Signature | S | Draw a signature once in the Signatures panel; it is saved and placed with one click. |
 | Comment | Z | A sticky note anchored to a point: click a page, type, and it is saved as a real PDF comment (Text annotation) with author, date and colour, so Acrobat, Preview and other readers show it as a comment. The Comments tab lists every comment; comments already in a PDF are loaded for reading and editing. |
 | Pictures | drag and drop | Drop PNG, JPEG, GIF, BMP or WebP files from Finder onto a page, or use File › Place Picture. |
+
+### Selecting text and taking snapshots
+
+The **Select Text** tool (D) selects the text already in the PDF, as Acrobat's selection tool
+does. Drag along the text to select it in reading order, Alt-drag a box to select a column, double-click a word,
+triple-click a line or press ⌘A for the whole page. ⌘C (or **Copy**) puts the text on the
+clipboard with its spaces and line breaks restored, accents that TeX draws as separate glyphs
+joined to their letters, and superscripts kept on their line. The **Highlight**, **Underline** and
+**Strikethrough** buttons turn the selection into one object per line in the chosen colour, so
+markup is undone, moved and saved like any other object. The text comes from hayro's interpreter,
+which reports every glyph with its Unicode value and position, so it works for embedded,
+standard and CID fonts with a ToUnicode map. Scanned pages without a text layer have nothing to
+select, and the Snapshot tool copies them as pictures instead.
+
+The **Snapshot** tool (camera icon, or Edit › Snapshot of Page) copies an area of a page, with all
+your edits, as a picture. Drag around the area, or click once for the whole page, and the
+picture goes to the system clipboard for other programs and to PDFflow's own clipboard, so ⌘V
+pastes it back as a picture object on any page or in another document. The resolution is set in
+the options bar (72 to 600 dpi), and the Snapshot panel saves the picture as PNG or JPEG.
 
 ### Pen tools
 
@@ -177,6 +196,52 @@ Saving re-reads the untouched source file, rebuilds the page tree in the editor'
 one content stream per edited page, so the original content, links and fonts are kept. Unedited
 JPEGs are embedded unchanged, and edited pictures are embedded with their new pixels and alpha.
 
+## AI agents (MCP)
+
+PDFflow can be driven by AI agents through the
+[Model Context Protocol](https://modelcontextprotocol.io). The open window is the workspace,
+so the agent and the user edit the same document, every change an agent makes appears at
+once, and each one can be undone from the Edit menu. While PDFflow runs, it serves MCP's
+Streamable HTTP transport at `http://127.0.0.1:7878/mcp` (set `PDFFLOW_MCP_PORT` to change the
+port, or `PDFFLOW_MCP=0` to turn the server off). `pdfflow --mcp` is the same server over
+stdio for clients that start servers as processes. It answers the handshake itself, forwards
+each tool call to the window and starts PDFflow when it is not running yet. The robot icon in
+the status bar lights up while an agent works and shows the address on hover.
+
+To connect Claude Code, run either command:
+
+```sh
+claude mcp add --scope user pdfflow -- /Applications/PDFflow.app/Contents/MacOS/pdfflow --mcp
+claude mcp add --scope user --transport http pdfflow http://127.0.0.1:7878/mcp
+```
+
+Claude Desktop and other stdio clients take the same command in their configuration:
+
+```json
+{ "mcpServers": { "pdfflow": { "command": "/Applications/PDFflow.app/Contents/MacOS/pdfflow", "args": ["--mcp"] } } }
+```
+
+The 46 tools cover the whole editor. Pages are numbered from 1, objects on a page from 0, and
+positions are PDF points from the page's top-left corner with y pointing down.
+
+| Group | Tools |
+|---|---|
+| Document | `open_pdf`, `new_document`, `save_pdf`, `export_pages`, `document_info`, `undo`, `redo` |
+| View | `go_to_page`, `set_view`, `set_tool`, `render_page` (a PNG of the page, edits included, so the agent can look at its work) |
+| Text | `get_text`, `get_text_lines` (lines with boxes), `find_text`, `select_text`, `copy_text`, `markup_text` (highlight, underline or strike out every match of a phrase) |
+| Snapshot | `snapshot`, `paste`, `copy_object` |
+| Pages | `insert_blank_page`, `duplicate_page`, `rotate_page`, `move_page`, `delete_page` |
+| Objects | `list_objects`, `add_text`, `add_shape`, `add_whiteout`, `add_ink`, `add_path`, `add_image`, `add_comment`, `place_signature`, `update_object`, `delete_object`, `arrange_object`, `duplicate_object`, `select_object` |
+| Pictures | `adjust_picture` (the Image › Adjustments commands), `crop_picture`, `export_picture` |
+| Comments and signatures | `list_comments`, `list_signatures`, `list_digital_ids`, `sign_pdf` |
+
+The server listens on 127.0.0.1 only, and it refuses requests that carry a non-local `Origin`
+header or a body that is not `application/json`, so a web page cannot reach it through the
+browser. Any program on the same computer can still connect, as with other local MCP servers,
+so set `PDFFLOW_MCP=0` on shared machines. The brush, clone and healing tools are not offered to
+agents, because they need a hand on the picture. Tool calls run between frames of the window,
+so a call waits while a modal dialog is open in PDFflow and fails after two minutes.
+
 ## Build and run
 
 ```sh
@@ -194,6 +259,7 @@ x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 |---|---|---|---|
 | V | Move | ⌘O / ⌘S / ⇧⌘S | Open / Save / Save As |
 | H (or hold Space) | Hand | ⌘Z / ⇧⌘Z | Undo / Redo |
+| D | Select Text | ⌘C / ⌘A | Copy the selected text / select all text on the page |
 | T | Text | ⌘C / ⌘V / ⌘D | Copy / Paste / Duplicate |
 | B / K | Brush / Highlighter | ⌫ | Delete the object, or the selected pixels |
 | P / ⇧P | Pen tools / next pen tool | Enter, Esc | Finish a path, apply or cancel a crop |
@@ -209,7 +275,7 @@ x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 
 ## Small and light
 
-The release binary is about 12.4 MB (the digital-signature crypto adds about 1.5 MB), and with a 13-page journal paper open at 150 % on a Retina
+The release binary is about 13.6 MB (the digital-signature crypto adds about 1.5 MB and the MCP server about 0.2 MB), and with a 13-page journal paper open at 150 % on a Retina
 display the app uses about 95 MB of memory. It runs egui on the glow (OpenGL) renderer with no web
 view and repaints only on input. Page textures are capped at 4096 px per side and 12 MP and are
 kept only for visible pages, and placed pictures keep a preview of at most 1024 px on screen while
@@ -228,7 +294,7 @@ when editing starts. The icons are Lucide SVGs flattened to polylines at build t
 
 ## Tests
 
-`cargo test` runs 47 tests. Round-trip tests save a document, render the saved file again with
+`cargo test` runs 61 tests. Round-trip tests save a document, render the saved file again with
 hayro and check pixels for every page rotation and crop box, embedded text, pictures, ink, filled
 paths, edited pixels and page reordering. Interaction tests drive the real window headlessly with
 egui_kittest: drawing, typing Thai, moving, resizing, undo, signatures, the Page Grid, every pen
@@ -243,6 +309,17 @@ duplicated on the next save). Unit tests check that every adjustment leaves a pi
 its default settings, that Hue/Saturation +40/+25/−10 turns (240, 160, 30) into Photoshop's
 (173, 243, 0) within two levels, and Levels, Curves, Brightness, Threshold, Posterize, Auto
 Contrast, Equalize, Shadows/Highlights and `.cube` parsing.
+
+Further tests cover the new tools. Text extraction is checked for positions, restored spaces and
+line breaks, kerned words, searches that cross a line break, column selection, merged accents and
+superscripts. Select Text is driven by dragging, double-clicking, ⌘A and Escape, and a highlight
+is checked to land over the selected word as one undo step. Snapshot is checked by dragging an area,
+which gives a 300 × 150 px picture for 144 × 72 pt at 150 dpi, then ⌘V pastes it onto the area it
+came from, and the renderer is checked on rotated pages. The MCP layer is tested for the handshake,
+the tool list, errors, image replies, the refusal of browser origins and a full HTTP round trip.
+A scripted agent session finds and underlines text, adds text, an arrow and a comment, edits,
+inserts, rotates, moves and deletes pages with undo, renders and snapshots a page, saves the file,
+then reopens it and reads the typed Thai text back out of the saved PDF.
 
 ## Licences
 

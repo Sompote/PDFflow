@@ -288,6 +288,13 @@ impl Doc {
         Doc { path, source: Some(bytes), pages, source_pages: sizes.len(), source_notes: vec![Vec::new(); sizes.len()], dirty: false, undo: Vec::new(), redo: Vec::new() }
     }
 
+    /// A copy holding only the pages `idx` (in that order) over the same source, for exporting
+    /// or rendering part of the document.
+    pub fn subset(&self, idx: &[usize]) -> Doc {
+        let pages = idx.iter().filter_map(|i| self.pages.get(*i).cloned()).collect();
+        Doc { path: None, source: self.source.clone(), pages, source_pages: self.source_pages, source_notes: Vec::new(), dirty: false, undo: Vec::new(), redo: Vec::new() }
+    }
+
     pub fn title(&self) -> String {
         self.path
             .as_ref()

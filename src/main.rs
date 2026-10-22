@@ -11,11 +11,15 @@ mod icon_data;
 mod icons;
 #[cfg(target_os = "macos")]
 mod macopen;
+mod mcp;
+mod mcp_tools;
 mod path;
 mod raster;
 mod render;
 mod sig;
+mod snapshot;
 mod text;
+mod textlayer;
 mod theme;
 mod widgets;
 
@@ -35,8 +39,23 @@ fn app_icon() -> std::sync::Arc<egui::IconData> {
     std::sync::Arc::new(egui::IconData { rgba: img.into_raw(), width, height })
 }
 
-fn main() -> eframe::Result {
-    let path = std::env::args_os().nth(1).map(std::path::PathBuf::from);
+fn main() -> std::process::ExitCode {
+    // `pdfflow --mcp`: an MCP server on stdin/stdout that drives the editor window.
+    let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp") {
+        return mcp::bridge(&args);
+    }
+    match run() {
+        Ok(()) => std::process::ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("PDFflow: {e}");
+            std::process::ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> eframe::Result {
+    let path = std::env::args_os().skip(1).find(|a| !a.to_string_lossy().starts_with("-psn_")).map(std::path::PathBuf::from);
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 820.0])

@@ -24,11 +24,18 @@ mod signui;
 mod notes;
 #[path = "adjui.rs"]
 mod adjui;
+#[path = "seltext.rs"]
+mod seltext;
+#[path = "agent.rs"]
+mod agent;
 use adjui::AdjustDialog;
 use pen::{Part, PenDraft};
 use rtools::{Live, PixSel, RasterOpts};
 use signui::{CreateDialog, ImportDialog, SignDialog, TrustDialog};
 use notes::NoteEdit;
+#[cfg(test)]
+pub(crate) use seltext::Markup;
+use seltext::{Snap, TextSel};
 #[cfg(test)]
 pub(crate) fn notes_without_comments_for_test(b: &[u8]) -> Option<Vec<u8>> {
     notes::without_comments(b)
@@ -47,6 +54,8 @@ const MAX_THUMBS: usize = 40;
 pub enum Tool {
     Move,
     Hand,
+    SelectText,
+    Snapshot,
     Text,
     Brush,
     Highlighter,
@@ -76,41 +85,43 @@ pub enum Tool {
     Comment,
 }
 
-const TOOLS: &[(Tool, &str, &str, Key)] = &[
-    (Tool::Move, "mouse-pointer-2", "Move (V)", Key::V),
-    (Tool::Hand, "hand", "Hand (H)", Key::H),
-    (Tool::Text, "type", "Text (T)", Key::T),
-    (Tool::Brush, "pencil", "Brush (B)", Key::B),
-    (Tool::Highlighter, "highlighter", "Highlighter (K)", Key::K),
-    (Tool::PenPath, "pen-tool", "Pen (P)", Key::P),
-    (Tool::FreeformPen, "pen-freeform", "Freeform Pen (P)", Key::P),
-    (Tool::CurvaturePen, "pen-curvature", "Curvature Pen (P)", Key::P),
-    (Tool::AddAnchor, "pen-add-anchor", "Add Anchor Point (P)", Key::P),
-    (Tool::DeleteAnchor, "pen-delete-anchor", "Delete Anchor Point (P)", Key::P),
-    (Tool::ConvertPoint, "convert-point", "Convert Point (P)", Key::P),
-    (Tool::Line, "slash", "Line (L)", Key::L),
-    (Tool::Arrow, "move-up-right", "Arrow (A)", Key::A),
-    (Tool::Rect, "square", "Rectangle (R)", Key::R),
-    (Tool::Ellipse, "circle", "Ellipse (E)", Key::E),
-    (Tool::Whiteout, "eraser", "Whiteout: cover content with white (W)", Key::W),
-    (Tool::Signature, "signature", "Signature (S)", Key::S),
-    (Tool::Comment, "message-square-text", "Comment (Z)", Key::Z),
-    (Tool::Marquee, "square-dashed", "Rectangular Marquee (M)", Key::M),
-    (Tool::Lasso, "lasso", "Lasso (Q)", Key::Q),
-    (Tool::Crop, "crop", "Crop (C)", Key::C),
-    (Tool::Eyedropper, "pipette", "Eyedropper (I)", Key::I),
-    (Tool::Heal, "bandage", "Spot Healing Brush (J)", Key::J),
-    (Tool::PaintBrush, "brush", "Brush (N)", Key::N),
-    (Tool::CloneStamp, "stamp", "Clone Stamp (Y)", Key::Y),
-    (Tool::Eraser, "eraser-background", "Eraser (X)", Key::X),
-    (Tool::Gradient, "blend", "Gradient (F)", Key::F),
-    (Tool::Blur, "droplet", "Blur (U)", Key::U),
-    (Tool::Dodge, "lollipop", "Dodge / Burn (O)", Key::O),
+const TOOLS: &[(Tool, &str, &str, Option<Key>)] = &[
+    (Tool::Move, "mouse-pointer-2", "Move (V)", Some(Key::V)),
+    (Tool::Hand, "hand", "Hand (H)", Some(Key::H)),
+    (Tool::SelectText, "text-cursor", "Select Text (D)", Some(Key::D)),
+    (Tool::Snapshot, "camera", "Snapshot: copy an area as a picture", None),
+    (Tool::Text, "type", "Text (T)", Some(Key::T)),
+    (Tool::Brush, "pencil", "Brush (B)", Some(Key::B)),
+    (Tool::Highlighter, "highlighter", "Highlighter (K)", Some(Key::K)),
+    (Tool::PenPath, "pen-tool", "Pen (P)", Some(Key::P)),
+    (Tool::FreeformPen, "pen-freeform", "Freeform Pen (P)", Some(Key::P)),
+    (Tool::CurvaturePen, "pen-curvature", "Curvature Pen (P)", Some(Key::P)),
+    (Tool::AddAnchor, "pen-add-anchor", "Add Anchor Point (P)", Some(Key::P)),
+    (Tool::DeleteAnchor, "pen-delete-anchor", "Delete Anchor Point (P)", Some(Key::P)),
+    (Tool::ConvertPoint, "convert-point", "Convert Point (P)", Some(Key::P)),
+    (Tool::Line, "slash", "Line (L)", Some(Key::L)),
+    (Tool::Arrow, "move-up-right", "Arrow (A)", Some(Key::A)),
+    (Tool::Rect, "square", "Rectangle (R)", Some(Key::R)),
+    (Tool::Ellipse, "circle", "Ellipse (E)", Some(Key::E)),
+    (Tool::Whiteout, "eraser", "Whiteout: cover content with white (W)", Some(Key::W)),
+    (Tool::Signature, "signature", "Signature (S)", Some(Key::S)),
+    (Tool::Comment, "message-square-text", "Comment (Z)", Some(Key::Z)),
+    (Tool::Marquee, "square-dashed", "Rectangular Marquee (M)", Some(Key::M)),
+    (Tool::Lasso, "lasso", "Lasso (Q)", Some(Key::Q)),
+    (Tool::Crop, "crop", "Crop (C)", Some(Key::C)),
+    (Tool::Eyedropper, "pipette", "Eyedropper (I)", Some(Key::I)),
+    (Tool::Heal, "bandage", "Spot Healing Brush (J)", Some(Key::J)),
+    (Tool::PaintBrush, "brush", "Brush (N)", Some(Key::N)),
+    (Tool::CloneStamp, "stamp", "Clone Stamp (Y)", Some(Key::Y)),
+    (Tool::Eraser, "eraser-background", "Eraser (X)", Some(Key::X)),
+    (Tool::Gradient, "blend", "Gradient (F)", Some(Key::F)),
+    (Tool::Blur, "droplet", "Blur (U)", Some(Key::U)),
+    (Tool::Dodge, "lollipop", "Dodge / Burn (O)", Some(Key::O)),
 ];
 
 impl Tool {
     fn name(self) -> &'static str {
-        TOOLS.iter().find(|t| t.0 == self).map(|t| t.2.split(" (").next().unwrap_or("")).unwrap_or("")
+        TOOLS.iter().find(|t| t.0 == self).map(|t| t.2.split([':', '(']).next().unwrap_or("").trim_end()).unwrap_or("")
     }
     fn icon(self) -> &'static str {
         TOOLS.iter().find(|t| t.0 == self).map(|t| t.1).unwrap_or("")
@@ -145,6 +156,9 @@ enum Drag {
     RLasso { page: usize, idx: usize, pts: Vec<Pos2> },
     RCrop { page: usize, idx: usize, start: Pos2 },
     RGradient { page: usize, idx: usize, start: Pos2, cur: Pos2 },
+    /// Select Text: `anchor` is the caret where the drag began; Alt drags a column box.
+    TextSel { page: usize, anchor: Option<usize>, start: Pos2, column: bool },
+    Snap { page: usize, start: Pos2, cur: Pos2 },
 }
 
 struct Editing {
@@ -224,6 +238,14 @@ pub struct App {
     trust_dlg: Option<TrustDialog>,
     sign_placing: Option<SignDialog>,
     adjust_dlg: Option<AdjustDialog>,
+    /// Text of the source pages, extracted when first needed (key: source page index).
+    text_cache: HashMap<usize, Arc<crate::textlayer::PageText>>,
+    text_sel: Option<TextSel>,
+    snap: Option<Snap>,
+    snap_dpi: f32,
+    /// The MCP server agents drive the editor through, when it could start.
+    agent: Option<crate::mcp::Server>,
+    agent_note: Option<(String, f64)>,
 }
 
 impl App {
@@ -303,6 +325,12 @@ impl App {
             trust_dlg: None,
             sign_placing: None,
             adjust_dlg: None,
+            text_cache: HashMap::new(),
+            text_sel: None,
+            snap: None,
+            snap_dpi: 150.0,
+            agent: if cfg!(test) { None } else { crate::mcp::Server::start(cc.egui_ctx.clone()) },
+            agent_note: None,
         };
         #[cfg(target_os = "macos")]
         crate::macopen::set_context(&cc.egui_ctx);
@@ -340,6 +368,8 @@ impl App {
         self.sig_reports.clear();
         self.sig_panel = false;
         self.note_edit = None;
+        self.text_cache.clear();
+        self.text_sel = None;
     }
 
     fn open_path(&mut self, path: PathBuf) {
@@ -413,21 +443,8 @@ impl App {
                 }
             }
         };
-        // An untouched document is written back byte for byte (signatures stay valid).
-        let bytes = match (&self.doc.source, self.doc.is_pristine()) {
-            (Some(src), true) => Ok(src.as_ref().clone()),
-            _ => export::save(&self.doc),
-        };
-        let result = bytes.and_then(|bytes| {
-            let tmp = path.with_extension("pdf.tmp");
-            std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
-            std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
-            Ok(bytes.len())
-        });
-        match result {
+        match self.write_pdf(path) {
             Ok(n) => {
-                self.doc.path = Some(path);
-                self.doc.dirty = false;
                 self.status = format!("Saved {} ({:.1} MB)", self.doc.title(), n as f32 / 1.0e6);
                 true
             }
@@ -436,6 +453,21 @@ impl App {
                 false
             }
         }
+    }
+
+    /// Write the document to `path` (through a temporary file) and make it the document's file.
+    pub(crate) fn write_pdf(&mut self, path: PathBuf) -> Result<usize, String> {
+        // An untouched document is written back byte for byte (signatures stay valid).
+        let bytes = match (&self.doc.source, self.doc.is_pristine()) {
+            (Some(src), true) => src.as_ref().clone(),
+            _ => export::save(&self.doc)?,
+        };
+        let tmp = path.with_extension("pdf.tmp");
+        std::fs::write(&tmp, &bytes).map_err(|e| e.to_string())?;
+        std::fs::rename(&tmp, &path).map_err(|e| e.to_string())?;
+        self.doc.path = Some(path);
+        self.doc.dirty = false;
+        Ok(bytes.len())
     }
 
     fn insert_image_dialog(&mut self, ctx: &egui::Context) {
@@ -485,6 +517,7 @@ impl App {
         self.current = self.current.min(self.doc.pages.len() - 1);
         self.sel = None;
         self.prop_session = None;
+        self.text_sel = None;
     }
 
     pub(crate) fn add_blank(&mut self, at: usize) {
@@ -806,6 +839,9 @@ impl App {
             }
         }
         self.adjust_shortcuts(ctx);
+        if self.tool == Tool::SelectText && sc(Modifiers::COMMAND, Key::A) {
+            self.select_all_text(self.current);
+        }
         if self.tool.is_raster() {
             if sc(Modifiers::COMMAND, Key::J) {
                 self.picture_from_selection();
@@ -823,6 +859,7 @@ impl App {
         let events = ctx.input(|i| i.events.clone());
         for e in events {
             match e {
+                Event::Copy if self.tool == Tool::SelectText && self.text_sel.is_some() => self.copy_text_selection(ctx),
                 Event::Copy => self.clipboard = self.selected().cloned(),
                 Event::Cut => {
                     self.clipboard = self.selected().cloned();
@@ -869,7 +906,10 @@ impl App {
             }
         }
         for (tool, _, _, key) in TOOLS {
-            if !tool.is_pen() && ctx.input(|i| i.key_pressed(*key)) {
+            if let Some(key) = key
+                && !tool.is_pen()
+                && ctx.input(|i| i.key_pressed(*key))
+            {
                 self.set_tool(*tool);
             }
         }
@@ -897,7 +937,7 @@ impl App {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if self.crop.take().is_none() && self.pix_sel.take().is_none() {
+            if self.text_sel.take().is_none() && self.crop.take().is_none() && self.pix_sel.take().is_none() {
                 self.sel = None;
             }
         }
@@ -1039,6 +1079,19 @@ impl App {
                 }
                 if ui.add_enabled(has_sel, egui::Button::new("Send Backward")).clicked() {
                     self.restack(false);
+                }
+                ui.separator();
+                if ui.add_enabled(self.text_sel.is_some(), egui::Button::new("Copy Text").shortcut_text(format!("{cmd}C"))).clicked() {
+                    self.copy_text_selection(&ctx);
+                }
+                if ui.button("Select All Text on Page").clicked() {
+                    self.set_tool(Tool::SelectText);
+                    self.select_all_text(self.current);
+                }
+                if ui.button("Snapshot of Page").on_hover_text("Copy the current page, edits included, as a picture").clicked() {
+                    let page = self.current.min(self.doc.pages.len() - 1);
+                    let size = self.doc.pages[page].size;
+                    self.take_snapshot(&ctx, page, Rect::from_min_size(Pos2::ZERO, size));
                 }
             });
             ui.menu_button("Image", |ui| self.image_menu(ui));
@@ -1214,6 +1267,8 @@ impl App {
                     }
                 }
                 Tool::Marquee | Tool::Lasso | Tool::Crop | Tool::Eyedropper | Tool::Heal | Tool::PaintBrush | Tool::CloneStamp | Tool::Eraser | Tool::Gradient | Tool::Blur | Tool::Dodge => {}
+                Tool::SelectText => self.text_options(ui),
+                Tool::Snapshot => self.snapshot_options(ui),
                 Tool::Hand | Tool::Move => {
                     ui.label(egui::RichText::new("Drag to scroll. Hold Space with any tool to pan; ⌘-scroll or pinch to zoom.").color(t.text_faint));
                 }
@@ -1324,7 +1379,7 @@ impl App {
     /// Tool groups as laid out in the column (separators between groups).
     fn tool_groups() -> Vec<Vec<Tool>> {
         vec![
-            vec![Tool::Move, Tool::Hand],
+            vec![Tool::Move, Tool::Hand, Tool::SelectText, Tool::Snapshot],
             vec![Tool::Text, Tool::Brush, Tool::Highlighter, Tool::PenPath],
             vec![Tool::Line, Tool::Arrow, Tool::Rect, Tool::Ellipse],
             vec![Tool::Whiteout, Tool::Signature, Tool::Comment],
@@ -1616,6 +1671,10 @@ impl App {
             if r.clicked() {
                 self.toggle_grid();
             }
+            if self.agent.is_some() {
+                vline(ui, 16.0);
+                self.agent_badge(ui);
+            }
             vline(ui, 16.0);
             ui.label(egui::RichText::new(&self.status).color(t.text_faint));
         });
@@ -1766,6 +1825,7 @@ impl App {
             }
         }
 
+        self.text_overlay(&painter, &rects);
         self.pen_overlay(&painter, &rects, pointer);
         self.raster_overlay(&painter, &rects, pointer);
         self.text_editor(ui, &rects);
@@ -1976,6 +2036,10 @@ impl App {
             } else {
                 match self.tool {
                     Tool::Text => CursorIcon::Text,
+                    Tool::SelectText => {
+                        let over = pointer.and_then(|p| self.page_at(rects, p)).is_some_and(|(pi, pp)| self.cached_text(pi).is_some_and(|t| t.over_text(pp, 2.0)));
+                        if over || matches!(self.drag, Some(Drag::TextSel { .. })) { CursorIcon::Text } else { CursorIcon::Default }
+                    }
                     Tool::Move => {
                         let over_handle = pointer.zip(self.sel).is_some_and(|(p, (pi, oi))| {
                             self.doc.pages.get(pi).and_then(|pg| pg.objects.get(oi)).is_some_and(|o| {
@@ -2099,9 +2163,25 @@ impl App {
                         }
                     }
                 }
+                Tool::SelectText => {
+                    let alt = ui.input(|i| i.modifiers.alt);
+                    self.text_press(hit, alt, shift);
+                }
+                Tool::Snapshot => {
+                    if let Some((pi, pp)) = hit {
+                        self.drag = Some(Drag::Snap { page: pi, start: pp, cur: pp });
+                    }
+                }
                 Tool::Hand => {}
             }
             return;
+        }
+
+        // Double-click selects a word, triple-click a line.
+        if self.tool == Tool::SelectText && (resp.double_clicked() || resp.triple_clicked()) {
+            if let Some((pi, pp)) = pointer.and_then(|p| self.page_at(rects, p)) {
+                self.select_text_at(pi, pp, resp.triple_clicked());
+            }
         }
 
         // Double-click a text object with the Move tool to edit it.
@@ -2154,9 +2234,14 @@ impl App {
                         }
                     }
                 }
-                Drag::Create { page, cur, .. } => {
+                Drag::Create { page, cur, .. } | Drag::Snap { page, cur, .. } => {
                     if let Some(pp) = pp_of(*page) {
                         *cur = pp;
+                    }
+                }
+                Drag::TextSel { page, .. } => {
+                    if let Some(pp) = pp_of(*page) {
+                        self.text_drag(pp);
                     }
                 }
                 Drag::RPaint { .. } | Drag::RSelect { .. } | Drag::RLasso { .. } | Drag::RCrop { .. } | Drag::RGradient { .. } => {
@@ -2206,6 +2291,13 @@ impl App {
                         self.doc.pages[page].objects.push(o);
                         self.sel = Some((page, self.doc.pages[page].objects.len() - 1));
                     }
+                }
+                Drag::Snap { page, start, cur } => {
+                    // A click without a drag takes the whole page.
+                    let size = self.doc.pages[page].size;
+                    let r = if (cur - start).length() * z < 4.0 { Rect::from_min_size(Pos2::ZERO, size) } else { Rect::from_two_pos(start, cur) };
+                    let ctx = ui.ctx().clone();
+                    self.take_snapshot(&ctx, page, r);
                 }
                 d @ (Drag::Freeform { .. } | Drag::PathPoint { .. }) => self.pen_release(d),
                 d @ (Drag::RPaint { .. } | Drag::RSelect { .. } | Drag::RLasso { .. } | Drag::RCrop { .. } | Drag::RGradient { .. }) => self.raster_release(d),
@@ -2443,6 +2535,8 @@ impl eframe::App for App {
             self.note_popup(&ctx, &rects);
         }
         self.adjust_window(&ctx);
+        self.snapshot_window(&ctx);
+        self.agent_poll(&ctx);
         self.dialogs(&ctx);
         self.sign_dialogs(&ctx);
 
@@ -2515,6 +2609,12 @@ impl App {
     }
     pub(crate) fn rendered_counts(&self) -> (usize, usize) {
         (self.page_tex.len(), self.thumbs.len())
+    }
+    pub(crate) fn snapshot_size(&self) -> Option<(u32, u32)> {
+        self.snap.as_ref().map(|s| (s.img.width(), s.img.height()))
+    }
+    pub(crate) fn clipboard_is_picture(&self) -> bool {
+        matches!(self.clipboard.as_ref().map(|o| &o.kind), Some(Kind::Image(_)))
     }
 }
 
@@ -2854,7 +2954,21 @@ pub fn paint_obj(painter: &egui::Painter, page: &PageEntry, origin: Pos2, z: f32
             let w = (width * z).max(0.5);
             for st in strokes.iter() {
                 let pts: Vec<Pos2> = st.iter().map(|u| ts(obj.at(*u))).collect();
-                if pts.len() == 1 {
+                if *highlighter && pts.len() == 2 && pts[0] != pts[1] {
+                    // A straight highlight with the round caps the saved PDF has, in one shape
+                    // so the translucent ends do not overlap.
+                    let d = (pts[1] - pts[0]).normalized() * (w / 2.0);
+                    let n = vec2(-d.y, d.x);
+                    // Each cap bulges outwards: from one side through the end to the other side.
+                    let cap = |c: Pos2, out: Vec2, side: Vec2| {
+                        (0..=12).map(move |k| {
+                            let t = std::f32::consts::PI * k as f32 / 12.0;
+                            c + side * t.cos() + out * t.sin()
+                        })
+                    };
+                    let ring: Vec<Pos2> = cap(pts[1], d, n).chain(cap(pts[0], -d, -n)).collect();
+                    painter.add(Shape::convex_polygon(ring, c, Stroke::NONE));
+                } else if pts.len() == 1 {
                     painter.circle_filled(pts[0], w / 2.0, c);
                 } else {
                     painter.add(Shape::line(pts, Stroke::new(w, c)));

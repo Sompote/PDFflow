@@ -142,7 +142,11 @@ pub fn save(doc: &Doc) -> Res<Vec<u8>> {
     root.set("Count", count);
     pdf.prune_objects();
     let mut out = Vec::new();
-    pdf.save_modern(&mut out).map_err(err)?;
+    // A cross-reference stream without object streams: lopdf 0.38's object-stream writer
+    // (`save_modern`) leaves the object streams out of the cross-reference stream, which
+    // strict readers such as Poppler reject on larger files.
+    pdf.reference_table.cross_reference_type = lopdf::xref::XrefType::CrossReferenceStream;
+    pdf.save_to(&mut out).map_err(err)?;
     Ok(out)
 }
 
