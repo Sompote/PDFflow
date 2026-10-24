@@ -24,12 +24,12 @@ Katsushika Hokusai, c. 1831, public domain.</sub>
 
 ## Download
 
-**Version 0.1.3** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.3)):
+**Version 0.1.4** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.4)):
 
 | Platform | File |
 |---|---|
-| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.3-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-macOS-universal.zip) |
-| Windows 10 / 11, 64-bit | [PDFflow-0.1.3-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.3/PDFflow-0.1.3-windows-x64.zip) |
+| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.4-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-macOS-universal.zip) |
+| Windows 10 / 11, 64-bit | [PDFflow-0.1.4-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-windows-x64.zip) |
 
 The builds are not signed by Apple or Microsoft, so the first launch needs one extra step. On
 macOS, drag PDFflow to Applications, then right-click it and choose **Open** (or run
@@ -51,6 +51,12 @@ and delete, and the same commands are in the Page menu and on a thumbnail's righ
 The **Page Grid** (G, View › Page Grid, or the grid button in the status bar) shows every page at
 once. Click selects a page, double-click opens it, dragging reorders pages with an insertion
 marker, right-click offers the page commands, and ⌘-scroll or the slider sets the thumbnail size.
+
+**Full Screen** (⌃⌘F on macOS, F11 elsewhere, View › Full Screen, or the expand button in the
+status bar) fills the screen with the pages and collapses the chrome to one bar: every tool in a
+row with the page and zoom controls, then the options of the current tool, so colour, width, fill
+and the rest change exactly as they do in the options bar and drawing continues. Escape leaves
+full screen once there is nothing else left to cancel, as does the button at the right of the bar.
 
 ### Objects on the page
 
@@ -267,6 +273,7 @@ x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 | R / E | Rectangle / Ellipse | ⌘+ / ⌘− | Zoom (also ⌘-scroll and pinch) |
 | W / S / Z | Whiteout / Signature / Comment | ⌘0 / ⌘1 | Fit page / 100 % |
 | M / Q / C / I | Marquee / Lasso / Crop / Eyedropper | G | Page Grid (Esc returns) |
+| | | ⌃⌘F (F11) | Full Screen (Esc returns) |
 | J / N / Y / X | Healing / Brush / Clone / Eraser | ⌘J / ⌘A / ⌘D | New picture from selection / select all / deselect |
 | F / U / O | Gradient / Blur / Dodge | [ / ] | Brush size |
 | | | ⌘L / ⌘M / ⌘U / ⌘B | Levels / Curves / Hue/Saturation / Color Balance |
@@ -294,7 +301,7 @@ when editing starts. The icons are Lucide SVGs flattened to polylines at build t
 
 ## Tests
 
-`cargo test` runs 61 tests. Round-trip tests save a document, render the saved file again with
+`cargo test` runs 62 tests. Round-trip tests save a document, render the saved file again with
 hayro and check pixels for every page rotation and crop box, embedded text, pictures, ink, filled
 paths, edited pixels and page reordering. Interaction tests drive the real window headlessly with
 egui_kittest: drawing, typing Thai, moving, resizing, undo, signatures, the Page Grid, every pen

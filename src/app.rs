@@ -246,6 +246,12 @@ pub struct App {
     /// The MCP server agents drive the editor through, when it could start.
     agent: Option<crate::mcp::Server>,
     agent_note: Option<(String, f64)>,
+    /// Full Screen (View menu): the window fills the screen and the chrome collapses to one
+    /// bar of tools and tool options above the canvas, so drawing continues as before.
+    fullscreen: bool,
+    /// The window's full-screen state as the OS last reported it, so the green button and
+    /// the View menu stay in step.
+    os_fullscreen: Option<bool>,
 }
 
 impl App {
@@ -328,6 +334,8 @@ impl App {
             text_cache: HashMap::new(),
             text_sel: None,
             snap: None,
+            fullscreen: false,
+            os_fullscreen: None,
             snap_dpi: 150.0,
             agent: if cfg!(test) { None } else { crate::mcp::Server::start(cc.egui_ctx.clone()) },
             agent_note: None,
@@ -819,6 +827,9 @@ impl App {
         if sc(Modifiers::COMMAND, Key::Num1) {
             self.zoom_center(1.0);
         }
+        if sc(Modifiers::COMMAND | Modifiers::CTRL, Key::F) || sc(Modifiers::NONE, Key::F11) {
+            self.toggle_fullscreen(ctx);
+        }
         if typing {
             return;
         }
@@ -937,8 +948,8 @@ impl App {
             }
         }
         if ctx.input(|i| i.key_pressed(Key::Escape)) {
-            if self.text_sel.take().is_none() && self.crop.take().is_none() && self.pix_sel.take().is_none() {
-                self.sel = None;
+            if self.text_sel.take().is_none() && self.crop.take().is_none() && self.pix_sel.take().is_none() && self.sel.take().is_none() && self.fullscreen {
+                self.toggle_fullscreen(ctx);
             }
         }
         let step = if mods.shift { 10.0 } else { 1.0 };
@@ -972,6 +983,14 @@ impl App {
                 self.scroll_to_page(self.current + 1);
             }
         }
+    }
+
+    /// View › Full Screen (⌃⌘F, F11): asks the OS for a full-screen window and switches to the
+    /// one-bar layout. Escape leaves it once there is nothing else left to cancel.
+    pub(crate) fn toggle_fullscreen(&mut self, ctx: &egui::Context) {
+        self.fullscreen = !self.fullscreen;
+        self.flyout = None;
+        ctx.send_viewport_cmd(egui::ViewportCommand::Fullscreen(self.fullscreen));
     }
 
     fn toggle_grid(&mut self) {
@@ -1132,6 +1151,10 @@ impl App {
                 }
                 if ui.add(egui::Button::selectable(self.grid, "Page Grid").shortcut_text("G")).clicked() {
                     self.toggle_grid();
+                    ui.close();
+                }
+                if ui.add(egui::Button::selectable(self.fullscreen, "Full Screen").shortcut_text(if cfg!(target_os = "macos") { "⌃⌘F" } else { "F11" })).clicked() {
+                    self.toggle_fullscreen(&ctx);
                     ui.close();
                 }
                 ui.separator();
@@ -1671,12 +1694,88 @@ impl App {
             if r.clicked() {
                 self.toggle_grid();
             }
+            if icons::small(ui, "expand", if cfg!(target_os = "macos") { "Full screen (⌃⌘F)" } else { "Full screen (F11)" }).clicked() {
+                let ctx = ui.ctx().clone();
+                self.toggle_fullscreen(&ctx);
+            }
             if self.agent.is_some() {
                 vline(ui, 16.0);
                 self.agent_badge(ui);
             }
             vline(ui, 16.0);
             ui.label(egui::RichText::new(&self.status).color(t.text_faint));
+        });
+    }
+
+    /// The one bar of Full Screen: every tool in a row with the page and zoom controls, then the
+    /// options of the current tool (colour, width, fill, …) exactly as in the options bar.
+    fn fullscreen_bar(&mut self, ui: &mut Ui) {
+        let t = Tokens::get(ui.ctx());
+        let picture = self.picture_sel().is_some();
+        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+        ui.horizontal(|ui| {
+            for (g, group) in Self::tool_groups().into_iter().enumerate() {
+                if g > 0 {
+                    vline(ui, 22.0);
+                }
+                for tool in group {
+                    if tool.is_pen() {
+                        self.pen_slot(ui);
+                        continue;
+                    }
+                    let tip = TOOLS.iter().find(|x| x.0 == tool).map(|x| x.2).unwrap_or("");
+                    let enabled = !tool.is_raster() || picture;
+                    let tip = if enabled { tip.to_owned() } else { format!("{tip} · select a picture first") };
+                    if icons::button_state(ui, tool.icon(), self.tool == tool, enabled, &tip).clicked() {
+                        self.set_tool(tool);
+                    }
+                }
+            }
+            vline(ui, 22.0);
+            if icons::button(ui, "image", false, "Place picture… (or drag a picture onto a page)").clicked() {
+                let ctx = ui.ctx().clone();
+                self.insert_image_dialog(&ctx);
+            }
+            if icons::button(ui, "file-plus", false, "Insert blank page after the current page").clicked() {
+                self.add_blank(self.current + 1);
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.spacing_mut().item_spacing = vec2(4.0, 2.0);
+                if icons::button(ui, "minimize", false, if cfg!(target_os = "macos") { "Leave full screen (⌃⌘F, Esc)" } else { "Leave full screen (F11, Esc)" }).clicked() {
+                    let ctx = ui.ctx().clone();
+                    self.toggle_fullscreen(&ctx);
+                }
+                vline(ui, 22.0);
+                let tip = if self.grid { "Back to the page view (G)" } else { "Page grid: see all pages (G)" };
+                let r = icons::small(ui, "layout-grid", tip);
+                if self.grid {
+                    ui.painter().rect_stroke(r.rect, 3.0, Stroke::new(1.0, t.accent), StrokeKind::Inside);
+                }
+                if r.clicked() {
+                    self.toggle_grid();
+                }
+                if icons::small(ui, "maximize", "Fit page (⌘0)").clicked() {
+                    self.grid = false;
+                    self.fit_page();
+                }
+                if icons::small(ui, "zoom-in", "Zoom in (⌘+)").clicked() {
+                    self.zoom_center(self.zoom * 1.25);
+                }
+                let mut pct = self.zoom * 100.0;
+                if ui.add(egui::DragValue::new(&mut pct).range(10.0..=800.0).suffix("%").max_decimals(0).speed(1.0)).changed() {
+                    self.zoom_center(pct / 100.0);
+                }
+                if icons::small(ui, "zoom-out", "Zoom out (⌘−)").clicked() {
+                    self.zoom_center(self.zoom / 1.25);
+                }
+                vline(ui, 16.0);
+                ui.label(egui::RichText::new(format!("Page {} of {}", self.current + 1, self.doc.pages.len())).color(t.text_dim));
+            });
+        });
+        widgets_hline(ui);
+        ui.allocate_ui_with_layout(vec2(ui.available_width(), 30.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.spacing_mut().item_spacing = vec2(8.0, 2.0);
+            self.options_bar(ui);
         });
     }
 
@@ -2511,16 +2610,29 @@ impl eframe::App for App {
             self.shortcuts(&ctx);
         }
 
+        // The green button (or a gesture) changes the window too; follow it.
+        let os = ctx.input(|i| i.viewport().fullscreen);
+        if os.is_some() && os != self.os_fullscreen {
+            self.os_fullscreen = os;
+            if let Some(f) = os {
+                self.fullscreen = f;
+            }
+        }
+
         let bar = |fill| egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(8, 4));
-        egui::Panel::top("menu").frame(bar(t.chrome)).show(ui, |ui| self.menu_bar(ui));
-        egui::Panel::top("options").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).exact_size(36.0).show(ui, |ui| self.options_bar(ui));
-        egui::Panel::bottom("status").frame(bar(t.chrome)).exact_size(26.0).show(ui, |ui| self.status_bar(ui));
-        egui::Panel::left("tools").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(if self.two_cols { 72.0 } else { 42.0 }).resizable(false).show(ui, |ui| self.tool_column(ui));
-        egui::Panel::right("dock")
-            .frame(egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(4, 0)))
-            .default_size(250.0)
-            .size_range(200.0..=380.0)
-            .show(ui, |ui| self.dock(ui));
+        if self.fullscreen {
+            egui::Panel::top("fullscreen-bar").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.fullscreen_bar(ui));
+        } else {
+            egui::Panel::top("menu").frame(bar(t.chrome)).show(ui, |ui| self.menu_bar(ui));
+            egui::Panel::top("options").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).exact_size(36.0).show(ui, |ui| self.options_bar(ui));
+            egui::Panel::bottom("status").frame(bar(t.chrome)).exact_size(26.0).show(ui, |ui| self.status_bar(ui));
+            egui::Panel::left("tools").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(if self.two_cols { 72.0 } else { 42.0 }).resizable(false).show(ui, |ui| self.tool_column(ui));
+            egui::Panel::right("dock")
+                .frame(egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(4, 0)))
+                .default_size(250.0)
+                .size_range(200.0..=380.0)
+                .show(ui, |ui| self.dock(ui));
+        }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             self.sig_banner(ui);
             let r = ui.available_rect_before_wrap();
@@ -2564,6 +2676,12 @@ impl App {
     }
     pub(crate) fn grid_on(&self) -> bool {
         self.grid
+    }
+    pub(crate) fn fullscreen_on(&self) -> bool {
+        self.fullscreen
+    }
+    pub(crate) fn canvas_rect(&self) -> Rect {
+        self.view
     }
     pub(crate) fn pen_drafting(&self) -> bool {
         self.pen.is_some()
@@ -2681,6 +2799,11 @@ impl App {
             }
             self.close_note();
             self.open_note(0, 0);
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_FULLSCREEN").is_some() {
+            // The layout only: the window itself stays as it is, so the shot has a known size.
+            self.fullscreen = true;
+            self.set_tool(Tool::Brush);
         }
         if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_SIGS").is_some() {
             self.sig_panel = true;

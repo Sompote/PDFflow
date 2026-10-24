@@ -216,6 +216,43 @@ fn page_grid_toggles_and_reorders_by_drag() {
     assert!(!h.state().grid_on());
 }
 
+#[test]
+fn full_screen_keeps_the_tools_and_their_options_and_escape_leaves() {
+    use eframe::egui::Color32;
+    let mut h = harness(None);
+    let windowed = h.state().canvas_rect();
+    h.key_press_modifiers(Modifiers::COMMAND | Modifiers::CTRL, Key::F);
+    h.run_steps(3);
+    assert!(h.state().fullscreen_on());
+    // The canvas grows: no menu, dock, status bar or tool column, only the one bar on top.
+    let full = h.state().canvas_rect();
+    assert!(full.left() < 1.0 && full.right() > 1279.0 && full.bottom() > 819.0, "{windowed:?} -> {full:?}");
+    assert!(full.top() > 40.0 && full.top() < 90.0, "the bar is above the canvas: {full:?}");
+    // Tools still switch and draw, and the stroke colour chosen in the bar is used.
+    h.key_press(Key::R);
+    h.step();
+    assert_eq!(h.state().tool, Tool::Rect);
+    h.state_mut().opts_color_for_test(Color32::from_rgb(0, 120, 255));
+    dragp(&mut h, pos2(100.0, 100.0), pos2(220.0, 180.0));
+    let objs = &h.state().doc.pages[0].objects;
+    assert_eq!(objs.len(), 1);
+    match &objs[0].kind {
+        Kind::Shape { stroke, .. } => assert_eq!(*stroke, Color32::from_rgb(0, 120, 255)),
+        _ => panic!("drew something other than a shape"),
+    }
+    // Escape first clears the selection made by the Move tool, then leaves full screen.
+    h.key_press(Key::V);
+    h.step();
+    click(&mut h, pos2(150.0, 140.0));
+    h.key_press(Key::Escape);
+    h.run_steps(2);
+    assert!(h.state().fullscreen_on());
+    h.key_press(Key::Escape);
+    h.run_steps(3);
+    assert!(!h.state().fullscreen_on());
+    assert!(close(h.state().canvas_rect().min, windowed.min, 1.0));
+}
+
 fn click(h: &mut Harness<'_, App>, p: Pos2) {
     dragp(h, p, p);
 }
