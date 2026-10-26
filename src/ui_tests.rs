@@ -852,3 +852,33 @@ fn an_agent_edits_through_the_mcp_tools() {
     let comments = call(&mut h, "list_comments", json!({})).unwrap();
     assert_eq!(comments["comments"][0]["text"], "Check this line");
 }
+
+/// A page dropped from another window: the document gets a real source page, one undo step,
+/// and the file saved from it renders that page.
+#[test]
+fn importing_a_page_from_another_document() {
+    let mut h = harness(None);
+    let other = Arc::new(crate::tests::source_pdf(0));
+    let entry = crate::doc::PageEntry { src: crate::doc::PageSrc::Original(0), size: vec2(500.0, 700.0), rotation: 90, objects: Vec::new() };
+    let n = h.state_mut().import_pages(vec![entry.clone()], Some(other.clone()), 1).unwrap();
+    assert_eq!(n, 1);
+    h.run_steps(2);
+    let doc = &h.state().doc;
+    assert_eq!(doc.pages.len(), 2);
+    assert_eq!(doc.pages[1].src, crate::doc::PageSrc::Original(0));
+    assert_eq!(doc.pages[1].rotation, 90);
+    assert_eq!(doc.source_pages, 1);
+    assert!(doc.source.is_some() && doc.dirty);
+    // Before the first page this time, from the same file: appended as a second source page.
+    h.state_mut().import_pages(vec![entry], Some(other), 0).unwrap();
+    h.run_steps(2);
+    let doc = &h.state().doc;
+    assert_eq!(doc.pages.len(), 3);
+    assert_eq!(doc.pages[0].src, crate::doc::PageSrc::Original(1));
+    assert_eq!(doc.source_pages, 2);
+    undo(&mut h);
+    assert_eq!(h.state().doc.pages.len(), 2);
+    let out = crate::export::save(&h.state().doc).unwrap();
+    let pdf = lopdf::Document::load_mem(&out).unwrap();
+    assert_eq!(pdf.get_pages().len(), 2);
+}

@@ -285,7 +285,7 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let list_h = widgets::list_height(ui);
         let mut remove = None;
-        egui::ScrollArea::vertical().id_salt("ids").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(self.wid("ids")).max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             if !self.sig_reports.is_empty() {
                 let ok = self.sig_reports.iter().all(SigReport::valid);
                 let (icon, text, c) = if ok {

@@ -237,7 +237,7 @@ impl App {
         let t = Tokens::get(ui.ctx());
         let mut open = None;
         let count: usize = self.doc.pages.iter().map(|p| p.objects.iter().filter(|o| matches!(o.kind, Kind::Note { .. })).count()).sum();
-        egui::ScrollArea::vertical().id_salt("comments").auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(self.wid("comments")).auto_shrink([false, false]).show(ui, |ui| {
             if count == 0 {
                 ui.label(egui::RichText::new("No comments yet. Choose the Comment tool (Z) and click a page.").color(t.text_faint));
             }

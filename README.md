@@ -52,6 +52,18 @@ The **Page Grid** (G, View › Page Grid, or the grid button in the status bar) 
 once. Click selects a page, double-click opens it, dragging reorders pages with an insertion
 marker, right-click offers the page commands, and ⌘-scroll or the slider sets the thumbnail size.
 
+**Several documents** open in windows of their own: File › Open (⌘O), a PDF dropped on a window
+or double-clicked in Finder, and File › New (⌘N) each open a new window, unless the current
+window still shows an untouched empty document, and the Window menu lists the open windows and
+brings one to the front. Each window closes on its own (⌘W) and asks about unsaved changes
+first, while Quit asks window by window. To copy a page from one document into another, drag
+its thumbnail out of the Pages panel or the Page Grid and drop it on the other window's Pages
+panel or Page Grid, where an accent bar shows where it will land. The page arrives as a real PDF
+page, appended to the receiving document's source file with its fonts, vector content, pictures
+and inherited crop box and rotation, together with any objects placed on it in the editor, so it
+stays editable and is written out by the normal save. Dragging a thumbnail inside its own Pages
+panel reorders the pages, as it does in the Page Grid.
+
 **Full Screen** (⌃⌘F on macOS, F11 elsewhere, View › Full Screen, or the expand button in the
 status bar) fills the screen with the pages and collapses the chrome to one bar: every tool in a
 row with the page and zoom controls, then the options of the current tool, so colour, width, fill

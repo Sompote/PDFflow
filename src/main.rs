@@ -13,6 +13,7 @@ mod icons;
 mod macopen;
 mod mcp;
 mod mcp_tools;
+mod merge;
 mod path;
 mod raster;
 mod render;
@@ -33,7 +34,7 @@ use eframe::egui;
 /// The PDFflow mark, shown as the window and Dock icon and in the menu bar.
 pub const ICON_PNG: &[u8] = include_bytes!("../assets/icon.png");
 
-fn app_icon() -> std::sync::Arc<egui::IconData> {
+pub(crate) fn app_icon() -> std::sync::Arc<egui::IconData> {
     let img = image::load_from_memory(ICON_PNG).expect("bundled icon").to_rgba8();
     let (width, height) = img.dimensions();
     std::sync::Arc::new(egui::IconData { rgba: img.into_raw(), width, height })

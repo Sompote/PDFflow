@@ -220,3 +220,67 @@ fn saved_cross_reference_stream_lists_every_object() {
     assert_eq!(render(&out, 3).0, 600);
 }
 
+
+/// A one-page PDF with a red square at (100..200, 100..150) in display space, no crop box.
+fn red_pdf() -> Vec<u8> {
+    let mut d = Document::with_version("1.7");
+    let pages = d.new_object_id();
+    let content = d.add_object(Stream::new(dictionary! {}, b"1 0 0 rg 100 692 100 50 re f".to_vec()));
+    let page = d.add_object(dictionary! { "Type" => "Page", "Parent" => pages, "Contents" => content, "MediaBox" => vec![0.into(), 0.into(), 595.into(), 842.into()] });
+    d.objects.insert(pages, Object::Dictionary(dictionary! { "Type" => "Pages", "Kids" => vec![page.into()], "Count" => 1 }));
+    let cat = d.add_object(dictionary! { "Type" => "Catalog", "Pages" => pages });
+    d.trailer.set("Root", cat);
+    let mut out = Vec::new();
+    d.save_to(&mut out).unwrap();
+    out
+}
+
+/// A page copied from another PDF keeps its content, its inherited crop box and rotation,
+/// and lands after the pages already there.
+#[test]
+fn merged_page_keeps_content_crop_and_rotation() {
+    let base = red_pdf();
+    let other = source_pdf(90);
+    let (merged, first) = crate::merge::merge_pages(Some(&base), &other, &[0]).unwrap();
+    assert_eq!(first, 1);
+    let pdf = Document::load_mem(&merged).unwrap();
+    assert_eq!(pdf.get_pages().len(), 2);
+    // Page 1 is the base page, untouched.
+    let a = render(&merged, 0);
+    assert_eq!((a.0, a.1), (595, 842));
+    assert!(is_red(px(&a, 150.0, 125.0)));
+    // Page 2 is the other file's page: crop box 500 × 700 rotated 90°, blue box where it was.
+    let b = render(&merged, 1);
+    let orig = render(&other, 0);
+    assert_eq!((b.0, b.1), (orig.0, orig.1), "copied page has the original's size");
+    assert_eq!((b.0, b.1), (700, 500));
+    for (x, y) in [(50.0, 50.0), (350.0, 250.0), (680.0, 480.0), (100.0, 400.0)] {
+        assert_eq!(px(&b, x, y), px(&orig, x, y), "pixel {x},{y}");
+    }
+    // Without a base, the result holds only the chosen pages.
+    let (alone, first) = crate::merge::merge_pages(None, &other, &[0]).unwrap();
+    assert_eq!(first, 0);
+    assert_eq!(Document::load_mem(&alone).unwrap().get_pages().len(), 1);
+    let c = render(&alone, 0);
+    assert_eq!((c.0, c.1), (700, 500));
+}
+
+/// A document that received a page from another file saves it, with the editor's objects
+/// on top, through the normal export.
+#[test]
+fn imported_page_exports_with_its_objects() {
+    let base = red_pdf();
+    let other = source_pdf(0);
+    let (merged, first) = crate::merge::merge_pages(Some(&base), &other, &[0]).unwrap();
+    let mut doc = Doc::from_pdf(None, Arc::new(merged), &[vec2(595.0, 842.0), vec2(500.0, 700.0)]);
+    doc.pages[1].src = PageSrc::Original(first);
+    doc.pages[1].objects.push(red_box(Rect::from_min_max(pos2(50.0, 50.0), pos2(150.0, 100.0))));
+    doc.pages.swap(0, 1);
+    let out = export::save(&doc).unwrap();
+    let a = render(&out, 0);
+    assert_eq!((a.0, a.1), (500, 700));
+    assert!(is_red(px(&a, 100.0, 75.0)));
+    assert!(is_white(px(&a, 300.0, 300.0)));
+    let b = render(&out, 1);
+    assert!(is_red(px(&b, 150.0, 125.0)));
+}

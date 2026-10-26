@@ -8,7 +8,7 @@ use crate::widgets::{self, color_row, option_label, vline};
 use crate::{export, icons, text};
 use eframe::egui::{
     self, Color32, CursorIcon, Event, FontId, Id, Key, KeyboardShortcut, Modifiers, Pos2, Rect, Sense, Shape, Stroke, StrokeKind,
-    TextureHandle, TextureOptions, Ui, Vec2, pos2, vec2,
+    TextureHandle, TextureOptions, Ui, Vec2, ViewportBuilder, ViewportCommand, ViewportId, pos2, vec2,
 };
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
@@ -128,6 +128,7 @@ impl Tool {
     }
 }
 
+#[derive(Clone)]
 struct Opts {
     color: Color32,
     width: f32,
@@ -169,13 +170,74 @@ struct Editing {
     focus: bool,
 }
 
+/// What waits for the "Save changes?" answer: closing this window.
 enum Pending {
-    New,
-    Open(Option<PathBuf>),
-    Quit,
+    Close,
+}
+
+/// A page thumbnail being dragged, seen by every window: the source window updates it each
+/// frame, the window under the pointer offers an insertion point, and the root window copies
+/// the page when the button is released over another window.
+#[derive(Default)]
+pub(crate) struct Shared {
+    drag: Option<LiveDrag>,
+    /// The window under the pointer and the page index to insert before.
+    target: Option<(u64, usize)>,
+    /// Every open window: number, viewport and title, for the Window menu.
+    windows: Vec<(u64, ViewportId, String)>,
+    /// Frame counter of the root window, to drop a stale drag.
+    frame: u64,
+}
+
+struct LiveDrag {
+    from: u64,
+    page: usize,
+    /// Pointer in screen points (the OS coordinate space shared by all windows).
+    screen: Pos2,
+    released: bool,
+    /// The source window dropped the page inside itself (a reorder), so no copy follows.
+    handled: bool,
+    frame: u64,
+}
+
+/// Where this window accepts a dropped page: its Pages panel or its Page Grid, in window
+/// coordinates, recorded each frame.
+enum DropZone {
+    List { area: Rect, rows: Vec<(usize, Rect)> },
+    Grid { area: Rect, left: f32, cols: usize, cell: Vec2, n: usize },
 }
 
 pub struct App {
+    /// Window number: 0 for the first window, then one more for each window opened.
+    win: u64,
+    /// The other windows (each a document of its own), kept by the first window.
+    others: Vec<App>,
+    /// Asks the first window to stop showing this one.
+    closed: bool,
+    /// Close this window as if its close button were pressed (⌘W).
+    close_me: bool,
+    /// The window may go now (unsaved changes settled); the first window decides what follows.
+    want_close: bool,
+    /// Quit the whole application (File › Quit).
+    quit: bool,
+    quitting: bool,
+    quit_cancelled: bool,
+    /// Windows to open: a file, or `None` for an empty document.
+    spawn: Vec<Option<PathBuf>>,
+    /// Position and size the window is created with.
+    spawn_at: Option<(Pos2, Vec2)>,
+    first_frame: bool,
+    shared: Shared,
+    /// This window's inner and outer rect on screen, as the OS last reported them.
+    inner_rect: Rect,
+    outer_rect: Rect,
+    /// A page being dragged from the Pages panel.
+    thumb_drag: Option<usize>,
+    /// Set in the frame a page drag ended: the page and whether it was dropped in this window.
+    drag_released: Option<(usize, bool)>,
+    drop_zone: Option<DropZone>,
+    /// Every open window, for the Window menu.
+    window_list: Vec<(u64, ViewportId, String)>,
     pub(crate) doc: Doc,
     renderer: Renderer,
     page_tex: HashMap<usize, (f32, TextureHandle)>,
@@ -258,9 +320,62 @@ impl App {
     pub fn new(cc: &eframe::CreationContext<'_>, path: Option<PathBuf>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         theme::apply(&cc.egui_ctx, ThemeKind::ProMedium);
-        let mut app = App {
+        let mut app = Self::create(&cc.egui_ctx, 0, true);
+        #[cfg(target_os = "macos")]
+        crate::macopen::set_context(&cc.egui_ctx);
+        if let Some(p) = path {
+            app.open_path(p);
+        }
+        app
+    }
+
+    /// Another window, opened from `self`: it starts with the same tool settings, author,
+    /// signatures and identities, and is placed a little below and to the right of `self`.
+    fn child(&self, ctx: &egui::Context, win: u64, path: Option<PathBuf>) -> App {
+        let mut w = Self::create(ctx, win, false);
+        w.theme = self.theme;
+        w.opts = self.opts.clone();
+        w.ropts = self.ropts.clone();
+        w.author = self.author.clone();
+        w.note_color = self.note_color;
+        w.sigs = self.sigs.clone();
+        w.sig_sel = self.sig_sel;
+        w.ids = self.ids.clone();
+        w.id_sel = self.id_sel;
+        w.trusted = self.trusted.clone();
+        w.snap_dpi = self.snap_dpi;
+        w.dock_tabs = self.dock_tabs;
+        let size = if self.inner_rect.is_positive() { self.inner_rect.size() } else { vec2(1280.0, 820.0) };
+        let at = if self.outer_rect.is_positive() { self.outer_rect.min + vec2(30.0, 30.0) } else { pos2(60.0, 60.0) };
+        w.spawn_at = Some((at, size));
+        if let Some(p) = path {
+            w.open_path(p);
+        }
+        w
+    }
+
+    fn create(ctx: &egui::Context, win: u64, root: bool) -> Self {
+        App {
+            win,
+            others: Vec::new(),
+            closed: false,
+            close_me: false,
+            want_close: false,
+            quit: false,
+            quitting: false,
+            quit_cancelled: false,
+            spawn: Vec::new(),
+            spawn_at: None,
+            first_frame: true,
+            shared: Shared::default(),
+            inner_rect: Rect::NOTHING,
+            outer_rect: Rect::NOTHING,
+            thumb_drag: None,
+            drag_released: None,
+            drop_zone: None,
+            window_list: Vec::new(),
             doc: Doc::new_blank(),
-            renderer: Renderer::new(cc.egui_ctx.clone()),
+            renderer: Renderer::new(ctx.clone()),
             page_tex: HashMap::new(),
             thumbs: HashMap::new(),
             thumb_want: Vec::new(),
@@ -337,15 +452,40 @@ impl App {
             fullscreen: false,
             os_fullscreen: None,
             snap_dpi: 150.0,
-            agent: if cfg!(test) { None } else { crate::mcp::Server::start(cc.egui_ctx.clone()) },
+            agent: if cfg!(test) || !root { None } else { crate::mcp::Server::start(ctx.clone()) },
             agent_note: None,
-        };
-        #[cfg(target_os = "macos")]
-        crate::macopen::set_context(&cc.egui_ctx);
-        if let Some(p) = path {
-            app.open_path(p);
         }
-        app
+    }
+
+    /// An id for a widget of this window, so two windows never share widget state.
+    fn wid(&self, salt: impl std::hash::Hash + std::fmt::Debug) -> Id {
+        Id::new(("pdfflow-window", self.win)).with(salt)
+    }
+
+    fn viewport_id(&self) -> ViewportId {
+        if self.win == 0 { ViewportId::ROOT } else { ViewportId::from_hash_of(("pdfflow-window", self.win)) }
+    }
+
+    /// An empty, untouched document (a new window's start), which an opened file may replace.
+    fn is_fresh(&self) -> bool {
+        self.doc.path.is_none() && self.doc.source.is_none() && !self.doc.dirty && !self.doc.can_undo() && self.doc.pages.len() == 1 && self.doc.pages[0].objects.is_empty()
+    }
+
+    /// Open a file (asking for one when `path` is `None`): into this window while it still
+    /// shows an untouched empty document, else into a new window.
+    fn open_or_spawn(&mut self, path: Option<PathBuf>) {
+        let path = match path {
+            Some(p) => p,
+            None => match rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
+                Some(p) => p,
+                None => return,
+            },
+        };
+        if self.is_fresh() {
+            self.open_path(path);
+        } else {
+            self.spawn.push(Some(path));
+        }
     }
 
     // ----------------------------------------------------------------------------------- files
@@ -400,33 +540,73 @@ impl App {
         }
     }
 
-    fn pick_and_open(&mut self) {
-        if let Some(p) = rfd::FileDialog::new().add_filter("PDF", &["pdf"]).pick_file() {
-            self.open_path(p);
-        }
-    }
-
-    /// Run an action that would discard the document, asking first when there are unsaved changes.
-    fn guarded(&mut self, action: Pending) {
-        if self.doc.dirty {
-            self.pending = Some(action);
-        } else {
-            self.run_pending(action);
-        }
-    }
-
     fn run_pending(&mut self, action: Pending) {
         match action {
-            Pending::New => {
-                self.doc = Doc::new_blank();
-                self.reset_view();
-            }
-            Pending::Open(Some(p)) => self.open_path(p),
-            Pending::Open(None) => self.pick_and_open(),
-            Pending::Quit => {
+            Pending::Close => {
                 self.allow_close = true;
             }
         }
+    }
+
+    /// Copy pages from another document in before page `at`: pages of its source PDF are
+    /// appended to this document's source (see `merge`), blank pages are taken as they are,
+    /// and the placed objects come along. One undo step; returns how many pages were added.
+    pub(crate) fn import_pages(&mut self, mut entries: Vec<PageEntry>, src: Option<Arc<Vec<u8>>>, at: usize) -> Result<usize, String> {
+        if entries.is_empty() {
+            return Ok(0);
+        }
+        let originals: Vec<usize> = entries.iter().filter_map(|e| if let PageSrc::Original(i) = e.src { Some(i) } else { None }).collect();
+        if !originals.is_empty() {
+            let src = src.ok_or("The other document has no source PDF.")?;
+            let base = self.doc.source.as_ref().map(|b| b.as_slice());
+            let (merged, offset) = crate::merge::merge_pages(base, &src, &originals)?;
+            let merged = Arc::new(merged);
+            let render = notes::without_comments(&merged).map(Arc::new).unwrap_or_else(|| merged.clone());
+            let sizes = match self.renderer.open(render) {
+                Ok(s) if s.len() == offset + originals.len() => s,
+                other => {
+                    // Put the renderer back on the document it had.
+                    if let Some(old) = &self.doc.source {
+                        let r = notes::without_comments(old).map(Arc::new).unwrap_or_else(|| old.clone());
+                        let _ = self.renderer.open(r);
+                    }
+                    return Err(match other {
+                        Err(e) => e,
+                        Ok(_) => "The merged PDF has an unexpected number of pages.".into(),
+                    });
+                }
+            };
+            let mut k = 0;
+            for e in &mut entries {
+                if let PageSrc::Original(_) = e.src {
+                    e.src = PageSrc::Original(offset + k);
+                    e.size = sizes[offset + k];
+                    k += 1;
+                }
+            }
+            self.doc.source = Some(merged);
+            self.doc.source_pages = sizes.len();
+            self.doc.source_notes.resize(offset, Vec::new());
+            for e in &entries {
+                if let PageSrc::Original(_) = e.src {
+                    self.doc.source_notes.push(e.objects.iter().filter_map(crate::doc::note_key).collect());
+                }
+            }
+            self.page_tex.clear();
+            self.thumbs.clear();
+            self.last_want.clear();
+        }
+        let n = entries.len();
+        let at = at.min(self.doc.pages.len());
+        self.page_op(|pages, cur| {
+            for (k, e) in entries.into_iter().enumerate() {
+                pages.insert(at + k, e);
+            }
+            *cur = at;
+        });
+        self.scroll_thumbs_to = Some(at);
+        self.scroll_to_page(at);
+        Ok(n)
     }
 
     fn save(&mut self, save_as: bool) -> bool {
@@ -788,7 +968,7 @@ impl App {
                 }
             };
             if bytes.starts_with(b"%PDF") || path.extension().is_some_and(|e| e.eq_ignore_ascii_case("pdf")) {
-                self.guarded(Pending::Open(Some(path)));
+                self.open_or_spawn(Some(path));
                 continue;
             }
             let (page, at) = match pointer.and_then(|p| self.page_at(rects, p)) {
@@ -804,7 +984,7 @@ impl App {
         let sc = |m: Modifiers, k: Key| ctx.input_mut(|i| i.consume_shortcut(&KeyboardShortcut::new(m, k)));
         let cmd_shift = Modifiers::COMMAND | Modifiers::SHIFT;
         if sc(Modifiers::COMMAND, Key::O) {
-            self.guarded(Pending::Open(None));
+            self.open_or_spawn(None);
         }
         if sc(cmd_shift, Key::S) {
             self.save(true);
@@ -812,8 +992,14 @@ impl App {
         if sc(Modifiers::COMMAND, Key::S) {
             self.save(false);
         }
-        if sc(Modifiers::COMMAND, Key::N) {
-            self.guarded(Pending::New);
+        if sc(Modifiers::COMMAND, Key::N) || sc(cmd_shift, Key::N) {
+            self.spawn.push(None);
+        }
+        if sc(Modifiers::COMMAND, Key::W) {
+            self.close_me = true;
+        }
+        if sc(Modifiers::COMMAND, Key::Q) {
+            self.quit = true;
         }
         if sc(Modifiers::COMMAND, Key::Equals) || sc(Modifiers::COMMAND, Key::Plus) {
             self.zoom_center(self.zoom * 1.25);
@@ -1043,10 +1229,10 @@ impl App {
             let item = |ui: &mut Ui, label: &str, sc: &str| ui.add(egui::Button::new(label).shortcut_text(if sc.is_empty() { String::new() } else { format!("{cmd}{sc}") })).clicked();
             ui.menu_button("File", |ui| {
                 if item(ui, "New", "N") {
-                    self.guarded(Pending::New);
+                    self.spawn.push(None);
                 }
                 if item(ui, "Open…", "O") {
-                    self.guarded(Pending::Open(None));
+                    self.open_or_spawn(None);
                 }
                 ui.separator();
                 if item(ui, "Save", "S") {
@@ -1063,8 +1249,11 @@ impl App {
                     self.insert_image_dialog(&ctx);
                 }
                 ui.separator();
+                if item(ui, "Close Window", "W") {
+                    self.close_me = true;
+                }
                 if item(ui, "Quit", "Q") {
-                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                    self.quit = true;
                 }
             });
             ui.menu_button("Edit", |ui| {
@@ -1178,6 +1367,23 @@ impl App {
                     if ui.radio(self.theme == k, name).clicked() {
                         self.theme = k;
                         theme::apply(ui.ctx(), k);
+                    }
+                }
+            });
+            ui.menu_button("Window", |ui| {
+                if item(ui, "New Window", "N") {
+                    self.spawn.push(None);
+                }
+                if item(ui, "Open in New Window…", "O") {
+                    self.open_or_spawn(None);
+                }
+                ui.separator();
+                ui.label(egui::RichText::new("Drag a page thumbnail from one window onto another window's Pages panel to copy it there.").color(t.text_faint).size(11.0));
+                ui.separator();
+                for (win, vp, title) in self.window_list.clone() {
+                    if ui.radio(win == self.win, title).clicked() {
+                        ctx.send_viewport_cmd_to(vp, ViewportCommand::Focus);
+                        ui.close();
                     }
                 }
             });
@@ -1502,27 +1708,43 @@ impl App {
         let list_h = widgets::list_height(ui);
         let mut clicked = None;
         let mut menu_action: Option<(usize, u8)> = None;
+        let mut reorder: Option<(usize, usize)> = None;
         self.thumb_seen.clear();
         let scroll_to = self.scroll_thumbs_to.take();
-        egui::ScrollArea::vertical().id_salt("thumbs").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        let pointer = ui.input(|i| i.pointer.interact_pos());
+        let dragging = self.thumb_drag;
+        let mut rows: Vec<(usize, Rect)> = Vec::new();
+        let out = egui::ScrollArea::vertical().id_salt(self.wid("thumbs")).max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             let w = (ui.available_width() - 40.0).clamp(60.0, 150.0);
+            let mut started = None;
+            let mut stopped = None;
             for (i, page) in self.doc.pages.iter().enumerate() {
                 let vs = page.view_size();
                 let th = w * vs.y / vs.x;
-                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), th + 26.0), Sense::click());
+                let (row, resp) = ui.allocate_exact_size(vec2(ui.available_width(), th + 26.0), Sense::click_and_drag());
                 if scroll_to == Some(i) {
                     ui.scroll_to_rect(row, None);
+                }
+                if resp.drag_started() {
+                    started = Some(i);
+                }
+                if resp.drag_stopped() {
+                    stopped = Some(i);
                 }
                 if !ui.is_rect_visible(row) {
                     continue;
                 }
+                rows.push((i, row));
                 let r = Rect::from_min_size(pos2(row.center().x - w / 2.0, row.top() + 4.0), vec2(w, th));
                 if i == self.current {
                     ui.painter().rect_filled(row.shrink(1.0), t.radius_sm, t.row_selected);
-                } else if resp.hovered() {
+                } else if resp.hovered() && dragging.is_none() {
                     ui.painter().rect_filled(row.shrink(1.0), t.radius_sm, t.hover);
                 }
                 paint_thumb(ui.painter(), page, r, ppp, &self.thumbs, &mut self.thumb_want, &mut self.thumb_seen);
+                if dragging == Some(i) {
+                    ui.painter().rect_filled(r, 0.0, Color32::from_black_alpha(120));
+                }
                 ui.painter().rect_stroke(r, 0.0, Stroke::new(if i == self.current { 2.0 } else { 1.0 }, if i == self.current { t.accent } else { t.separator }), StrokeKind::Outside);
                 ui.painter().text(pos2(row.center().x, r.bottom() + 11.0), egui::Align2::CENTER_CENTER, format!("{}", i + 1), FontId::proportional(11.0), t.text_dim);
                 if resp.clicked() {
@@ -1537,11 +1759,46 @@ impl App {
                     }
                 });
             }
+            (started, stopped)
         });
+        let (started, stopped) = out.inner;
+        let area = out.inner_rect;
+        // Where a dragged page would land in this list (its own page, or one from another window).
+        let slot_at = |p: Pos2| -> Option<usize> {
+            if !area.contains(p) {
+                return None;
+            }
+            Some(rows.iter().find(|(_, r)| r.center().y > p.y).map(|(i, _)| *i).unwrap_or_else(|| rows.last().map(|(i, _)| i + 1).unwrap_or(0)))
+        };
+        if let Some(i) = started {
+            self.end_edit();
+            self.thumb_drag = Some(i);
+            self.current = i;
+        }
+        if let (Some(from), Some(p)) = (self.thumb_drag, pointer) {
+            if let Some(to) = slot_at(p) {
+                if to != from && to != from + 1 {
+                    paint_insert_marker(ui, &rows, area, to, t.accent);
+                }
+                ui.ctx().set_cursor_icon(CursorIcon::Grabbing);
+            }
+        }
+        if let Some(i) = stopped {
+            let inside = pointer.and_then(slot_at);
+            if let Some(to) = inside {
+                reorder = Some((i, to));
+            }
+            self.drag_released = Some((i, inside.is_some()));
+            self.thumb_drag = None;
+        }
+        self.drop_zone = Some(DropZone::List { area, rows });
         if let Some(i) = clicked {
             self.end_edit();
             self.current = i;
             self.scroll_to_page(i);
+        }
+        if let Some((from, to)) = reorder {
+            self.move_page_to(from, to);
         }
         if let Some((i, k)) = menu_action {
             self.current = i;
@@ -1584,7 +1841,7 @@ impl App {
         let list_h = widgets::list_height(ui);
         let page = self.current.min(self.doc.pages.len() - 1);
         let mut pick = None;
-        egui::ScrollArea::vertical().id_salt("layers").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(self.wid("layers")).max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             let objs = &self.doc.pages[page].objects;
             if objs.is_empty() {
                 ui.label(egui::RichText::new(format!("Page {} has no added objects.", page + 1)).color(t.text_faint));
@@ -1627,7 +1884,7 @@ impl App {
         let list_h = widgets::list_height(ui);
         let mut remove = None;
         let mut pick = None;
-        egui::ScrollArea::vertical().id_salt("sigs").max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
+        egui::ScrollArea::vertical().id_salt(self.wid("sigs")).max_height(list_h).auto_shrink([false, false]).show(ui, |ui| {
             if self.sigs.is_empty() {
                 ui.label(egui::RichText::new("No saved signatures yet. Press + to draw one.").color(t.text_faint));
             }
@@ -1981,21 +2238,17 @@ impl App {
         let scroll_to = self.scroll_thumbs_to.take();
         let pointer = ui.input(|i| i.pointer.hover_pos());
         let mut child = ui.new_child(egui::UiBuilder::new().max_rect(rect));
-        egui::ScrollArea::vertical().id_salt("grid").auto_shrink([false, false]).show(&mut child, |ui| {
+        egui::ScrollArea::vertical().id_salt(self.wid("grid")).auto_shrink([false, false]).show(&mut child, |ui| {
             let avail = ui.available_width();
             let cols = ((avail - 24.0) / cell.x).floor().max(1.0) as usize;
             let rows = n.div_ceil(cols);
             let left = ((avail - cols as f32 * cell.x) / 2.0).max(12.0);
             let (area, _) = ui.allocate_exact_size(vec2(avail, rows as f32 * cell.y + 24.0), Sense::hover());
             let cell_rect = |i: usize| Rect::from_min_size(area.min + vec2(left + (i % cols) as f32 * cell.x, 12.0 + (i / cols) as f32 * cell.y), cell);
-            // Insertion slot under the pointer while dragging a page.
-            let slot = self.grid_drag.and(pointer).map(|p| {
-                let col = ((p.x - area.min.x - left) / cell.x).clamp(0.0, cols as f32 - 0.01);
-                let row = ((p.y - area.min.y - 12.0) / cell.y).max(0.0) as usize;
-                let c = col as usize;
-                let after = col.fract() > 0.5;
-                (row * cols + c + after as usize).min(n)
-            });
+            // Insertion slot under the pointer while dragging a page (none once it leaves the grid).
+            let visible = ui.clip_rect().intersect(area);
+            let slot = self.grid_drag.and(pointer).filter(|p| visible.contains(*p)).map(|p| grid_slot(p, area, left, cols, cell, n));
+            self.drop_zone = Some(DropZone::Grid { area: visible, left, cols, cell, n });
             for i in 0..n {
                 let cr = cell_rect(i);
                 if scroll_to == Some(i) {
@@ -2037,6 +2290,7 @@ impl App {
                     if let Some(to) = slot {
                         reorder = Some((i, to));
                     }
+                    self.drag_released = Some((i, slot.is_some()));
                     self.grid_drag = None;
                 }
                 resp.context_menu(|ui| {
@@ -2050,10 +2304,7 @@ impl App {
             }
             if let (Some(to), Some(from)) = (slot, self.grid_drag) {
                 if to != from && to != from + 1 {
-                    // Accent bar at the insertion point.
-                    let (r, x) = if to < n { (cell_rect(to), 0.0) } else { (cell_rect(n - 1), cell.x) };
-                    let x = r.left() + x;
-                    ui.painter().line_segment([pos2(x, r.top() + 8.0), pos2(x, r.bottom() - 28.0)], Stroke::new(3.0, t.accent));
+                    paint_grid_marker(ui.painter(), to, area, left, cols, cell, n, t.accent);
                 }
                 ctx.set_cursor_icon(CursorIcon::Grabbing);
             }
@@ -2407,6 +2658,7 @@ impl App {
 
     /// The in-place text editor over the object being typed into.
     fn text_editor(&mut self, ui: &mut Ui, rects: &[Rect]) {
+        let edit_id = self.wid("pdf-text-edit");
         let Some(ed) = &mut self.editing else { return };
         let (p, i) = (ed.page, ed.idx);
         let Some(obj) = self.doc.pages.get(p).and_then(|pg| pg.objects.get(i)) else {
@@ -2431,7 +2683,7 @@ impl App {
         };
         let area = Rect::from_min_size(sr.min, vec2(sr.width() + size * z * 2.0, sr.height().max(lh)));
         let te = egui::TextEdit::multiline(&mut buf)
-            .id(Id::new("pdf-text-edit"))
+            .id(edit_id)
             .frame(egui::Frame::NONE)
             .margin(egui::Margin::ZERO)
             .desired_width(area.width())
@@ -2563,7 +2815,10 @@ impl App {
                     let a = self.pending.take().expect("pending");
                     self.run_pending(a);
                 }
-                Some(_) => self.pending = None,
+                Some(_) => {
+                    self.pending = None;
+                    self.quit_cancelled = true;
+                }
                 None => {}
             }
         }
@@ -2586,24 +2841,281 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// The first window draws itself, then every other window as an immediate viewport of
+    /// the same egui context, and finally settles what the windows asked for: new windows,
+    /// closed ones, quitting, and a page dropped from one window onto another.
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        let ctx = ui.ctx().clone();
+        let mut shared = std::mem::take(&mut self.shared);
+        shared.frame += 1;
+        shared.windows = std::iter::once((self.win, self.viewport_id(), self.window_title())).chain(self.others.iter().map(|w| (w.win, w.viewport_id(), w.window_title()))).collect();
+        // A PDF double-clicked in Finder (or dropped on the Dock icon) opens in a window of its own.
+        #[cfg(target_os = "macos")]
+        for p in crate::macopen::take() {
+            self.open_or_spawn(Some(p));
+        }
+        self.window_ui(ui, &mut shared);
+        let mut others = std::mem::take(&mut self.others);
+        for w in &mut others {
+            let (at, size) = w.spawn_at.unwrap_or((pos2(60.0, 60.0), vec2(1280.0, 820.0)));
+            let builder = ViewportBuilder::default()
+                .with_title(format!("{} — PDFflow", w.doc.title()))
+                .with_position(at)
+                .with_inner_size(size)
+                .with_min_inner_size([760.0, 480.0])
+                .with_drag_and_drop(true);
+            ctx.show_viewport_immediate(w.viewport_id(), builder, |ui, _class| w.window_ui(ui, &mut shared));
+        }
+        self.others = others;
+        self.after_windows(&ctx, &mut shared);
+        self.shared = shared;
+    }
+}
+
+impl App {
+    fn window_title(&self) -> String {
+        format!("{}{}", self.doc.title(), if self.doc.dirty { " •" } else { "" })
+    }
+
+    /// Windows other than the first are created here, next to the window that asked.
+    fn after_windows(&mut self, ctx: &egui::Context, shared: &mut Shared) {
+        // New windows.
+        let next = self.others.iter().map(|w| w.win).max().unwrap_or(self.win).max(self.win) + 1;
+        let mut n = 0;
+        let mut spawns: Vec<(usize, Option<PathBuf>)> = self.spawn.drain(..).map(|p| (0, p)).collect();
+        for (k, w) in self.others.iter_mut().enumerate() {
+            spawns.extend(w.spawn.drain(..).map(|p| (k + 1, p)));
+        }
+        for (k, path) in spawns {
+            let from = if k == 0 { &*self } else { &self.others[k - 1] };
+            let w = from.child(ctx, next + n, path);
+            n += 1;
+            self.others.push(w);
+        }
+
+        // A page dropped on another window.
+        if let Some(d) = shared.drag.as_ref().filter(|d| d.released || d.frame != shared.frame).map(|d| (d.from, d.page, d.released && !d.handled)) {
+            shared.drag = None;
+            let (from, page, copy) = d;
+            if let Some((to, at)) = shared.target.take().filter(|(to, _)| copy && from != *to) {
+                self.copy_page_between(from, page, to, at);
+                if let Some(vp) = self.window(to).map(|w| w.viewport_id()) {
+                    ctx.send_viewport_cmd_to(vp, ViewportCommand::Focus);
+                }
+            }
+        }
+
+        // Quit: ask about unsaved changes window by window, then leave.
+        if self.quit || self.others.iter().any(|w| w.quit) {
+            self.quit = false;
+            self.quitting = true;
+            self.quit_cancelled = false;
+            for w in &mut self.others {
+                w.quit = false;
+                w.quit_cancelled = false;
+            }
+        }
+        if self.quitting && (self.quit_cancelled || self.others.iter().any(|w| w.quit_cancelled)) {
+            self.quitting = false;
+            self.quit_cancelled = false;
+            for w in &mut self.others {
+                w.quit_cancelled = false;
+            }
+        }
+        if self.quitting {
+            if let Some(w) = self.others.iter_mut().find(|w| w.doc.dirty && !w.allow_close) {
+                if w.pending.is_none() {
+                    w.pending = Some(Pending::Close);
+                }
+            } else {
+                self.others.clear();
+                if self.doc.dirty && !self.allow_close {
+                    if self.pending.is_none() {
+                        self.pending = Some(Pending::Close);
+                    }
+                } else {
+                    ctx.send_viewport_cmd(ViewportCommand::Close);
+                }
+            }
+        }
+
+        // `PDFFLOW_SHOT_WINDOWS=other.pdf` (with `PDFFLOW_SHOT`): open that file in a second
+        // window and copy its first page in here, as a drop between windows would.
+        if let Some(other) = std::env::var_os("PDFFLOW_SHOT_WINDOWS") {
+            if self.frames == 5 {
+                self.spawn.push(Some(PathBuf::from(other)));
+            }
+            if self.frames == 40 {
+                if let Some(from) = self.others.first().map(|w| w.win) {
+                    self.copy_page_between(from, 0, self.win, 1);
+                }
+            }
+        }
+
+        // Windows that closed, and this window, which hands itself to another when closed.
+        self.others.retain(|w| !w.closed);
+        if self.want_close && !self.quitting {
+            self.want_close = false;
+            if self.others.is_empty() {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            } else {
+                self.promote(ctx);
+            }
+        }
+        shared.windows = std::iter::once((self.win, self.viewport_id(), self.window_title())).chain(self.others.iter().map(|w| (w.win, w.viewport_id(), w.window_title()))).collect();
+    }
+
+    /// The first window is closing while others are open: the newest other window takes
+    /// over the first window (its viewport cannot be closed without quitting), which moves to
+    /// where that window was.
+    fn promote(&mut self, ctx: &egui::Context) {
+        let mut w = self.others.pop().expect("another window");
+        let (at, size) = (w.outer_rect, w.inner_rect.size());
+        std::mem::swap(self, &mut w);
+        // `w` is now the old first window; keep what belongs to the application.
+        self.others = std::mem::take(&mut w.others);
+        self.agent = w.agent.take();
+        self.quitting = w.quitting;
+        self.win = w.win;
+        self.closed = false;
+        self.allow_close = false;
+        self.want_close = false;
+        self.spawn_at = None;
+        self.os_fullscreen = None;
+        self.fullscreen = w.fullscreen;
+        self.last_title.clear();
+        if at.is_positive() {
+            ctx.send_viewport_cmd(ViewportCommand::OuterPosition(at.min));
+            ctx.send_viewport_cmd(ViewportCommand::InnerSize(size));
+        }
+        ctx.send_viewport_cmd(ViewportCommand::Focus);
+    }
+
+    fn window(&self, win: u64) -> Option<&App> {
+        if self.win == win { Some(self) } else { self.others.iter().find(|w| w.win == win) }
+    }
+
+    fn window_mut(&mut self, win: u64) -> Option<&mut App> {
+        if self.win == win { Some(self) } else { self.others.iter_mut().find(|w| w.win == win) }
+    }
+
+    /// Copy page `page` of window `from` into window `to` before page `at`.
+    fn copy_page_between(&mut self, from: u64, page: usize, to: u64, at: usize) {
+        let Some(src) = self.window(from) else { return };
+        let Some(entry) = src.doc.pages.get(page).cloned() else { return };
+        let (bytes, title) = (src.doc.source.clone(), src.doc.title());
+        let Some(dst) = self.window_mut(to) else { return };
+        match dst.import_pages(vec![entry], bytes, at) {
+            Ok(n) => dst.status = format!("Copied {n} page{} from {title} (page {}).", if n == 1 { "" } else { "s" }, page + 1),
+            Err(e) => dst.error = Some(format!("Could not copy the page: {e}")),
+        }
+    }
+
+    /// Where a page dragged from another window would land here, in this window's coordinates.
+    fn drop_slot(&self, p: Pos2) -> Option<usize> {
+        match self.drop_zone.as_ref()? {
+            DropZone::List { area, rows } => {
+                if !area.contains(p) {
+                    return None;
+                }
+                Some(rows.iter().find(|(_, r)| r.center().y > p.y).map(|(i, _)| *i).unwrap_or_else(|| rows.last().map(|(i, _)| i + 1).unwrap_or(0)))
+            }
+            DropZone::Grid { area, left, cols, cell, n } => area.contains(p).then(|| grid_slot(p, *area, *left, *cols, *cell, *n)),
+        }
+    }
+
+    /// The marker for a page dragged over this window from another one, and this window's
+    /// own drag for the others to see.
+    fn cross_window_drag(&mut self, ctx: &egui::Context, shared: &mut Shared) {
+        let t = Tokens::get(ctx);
+        let origin = self.inner_rect.min;
+        if let Some(d) = shared.drag.as_ref().filter(|d| d.from != self.win && !d.released) {
+            let p = d.screen - origin.to_vec2();
+            match self.drop_slot(p) {
+                Some(slot) => {
+                    shared.target = Some((self.win, slot));
+                    let painter = ctx.layer_painter(egui::LayerId::new(egui::Order::Foreground, self.wid("drop-marker")));
+                    match self.drop_zone.as_ref() {
+                        Some(DropZone::List { area, rows }) => {
+                            painter.rect_stroke(area.shrink(1.0), 3.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+                            let y = match rows.iter().find(|(i, _)| *i == slot) {
+                                Some((_, r)) => r.top() + 1.0,
+                                None => rows.last().map(|(_, r)| r.bottom() - 1.0).unwrap_or(area.top() + 4.0),
+                            };
+                            painter.line_segment([pos2(area.left() + 8.0, y), pos2(area.right() - 8.0, y)], Stroke::new(3.0, t.accent));
+                        }
+                        Some(DropZone::Grid { area, left, cols, cell, n }) => {
+                            painter.rect_stroke(area.shrink(1.0), 3.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+                            paint_grid_marker(&painter, slot, *area, *left, *cols, *cell, *n, t.accent);
+                        }
+                        None => {}
+                    }
+                }
+                None => {
+                    if shared.target.is_some_and(|(w, _)| w == self.win) {
+                        shared.target = None;
+                    }
+                }
+            }
+            ctx.request_repaint();
+        }
+        let pointer = ctx.input(|i| i.pointer.latest_pos().or(i.pointer.interact_pos()));
+        if let Some((page, handled)) = self.drag_released.take() {
+            let screen = shared.drag.as_ref().filter(|d| d.from == self.win).map(|d| d.screen).or_else(|| pointer.map(|p| origin + p.to_vec2()));
+            shared.drag = Some(LiveDrag { from: self.win, page, screen: screen.unwrap_or(Pos2::ZERO), released: true, handled, frame: shared.frame });
+        } else if let (Some(page), Some(p)) = (self.thumb_drag.or(self.grid_drag), pointer) {
+            shared.drag = Some(LiveDrag { from: self.win, page, screen: origin + p.to_vec2(), released: false, handled: false, frame: shared.frame });
+            ctx.request_repaint();
+        }
+    }
+
+    /// One window: Photoshop layout (menu bar, options bar, tool column, canvas, dock).
+    fn window_ui(&mut self, ui: &mut Ui, shared: &mut Shared) {
         let ctx = ui.ctx().clone();
         let t = Tokens::get(&ctx);
         self.receive_renders(&ctx);
-        // A PDF double-clicked in Finder (or dropped on the Dock icon).
-        #[cfg(target_os = "macos")]
-        if let Some(p) = crate::macopen::take().pop() {
-            self.guarded(Pending::Open(Some(p)));
-        }
         self.raster_housekeeping();
         self.two_cols = Self::tool_columns_needed(ctx.content_rect().height() - 110.0);
+        if let Some(r) = ctx.input(|i| i.viewport().inner_rect) {
+            self.inner_rect = r;
+        }
+        if let Some(r) = ctx.input(|i| i.viewport().outer_rect) {
+            self.outer_rect = r;
+        }
+        if self.first_frame {
+            self.first_frame = false;
+            if self.win != 0 {
+                ctx.send_viewport_cmd(ViewportCommand::Icon(Some(crate::app_icon())));
+            }
+        }
+        self.drop_zone = None;
+        self.window_list = shared.windows.clone();
 
-        if ctx.input(|i| i.viewport().close_requested()) && !self.allow_close && self.doc.dirty {
-            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.pending = Some(Pending::Quit);
+        // Closing: unsaved changes are asked about first; the first window's viewport is the
+        // application's, so it is only closed after the other windows have been settled.
+        let close_req = ctx.input(|i| i.viewport().close_requested()) || std::mem::take(&mut self.close_me);
+        let siblings = shared.windows.len() > 1;
+        if close_req && !self.allow_close {
+            if self.doc.dirty {
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.pending = Some(Pending::Close);
+            } else if self.win == 0 && siblings {
+                // Another window takes this viewport over (see `promote`).
+                ctx.send_viewport_cmd(ViewportCommand::CancelClose);
+                self.want_close = true;
+            } else if self.win != 0 {
+                self.closed = true;
+            }
+            // The first window with no others: eframe closes it, and the application ends.
         }
         if self.allow_close {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            if self.win != 0 {
+                self.closed = true;
+            } else if siblings {
+                self.want_close = true;
+            } else {
+                ctx.send_viewport_cmd(ViewportCommand::Close);
+            }
         }
         let modal = self.trust_dlg.is_some() || self.sign_dlg.is_some() || self.create_dlg.is_some() || self.import_dlg.is_some() || self.delete_id.is_some() || self.confirm_unsign.is_some() || self.adjusting();
         if self.pending.is_none() && self.sig_pad.is_none() && self.error.is_none() && !modal {
@@ -2621,13 +3133,13 @@ impl eframe::App for App {
 
         let bar = |fill| egui::Frame::NONE.fill(fill).inner_margin(egui::Margin::symmetric(8, 4));
         if self.fullscreen {
-            egui::Panel::top("fullscreen-bar").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.fullscreen_bar(ui));
+            egui::Panel::top(self.wid("fullscreen-bar")).frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).show(ui, |ui| self.fullscreen_bar(ui));
         } else {
-            egui::Panel::top("menu").frame(bar(t.chrome)).show(ui, |ui| self.menu_bar(ui));
-            egui::Panel::top("options").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).exact_size(36.0).show(ui, |ui| self.options_bar(ui));
-            egui::Panel::bottom("status").frame(bar(t.chrome)).exact_size(26.0).show(ui, |ui| self.status_bar(ui));
-            egui::Panel::left("tools").frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(if self.two_cols { 72.0 } else { 42.0 }).resizable(false).show(ui, |ui| self.tool_column(ui));
-            egui::Panel::right("dock")
+            egui::Panel::top(self.wid("menu")).frame(bar(t.chrome)).show(ui, |ui| self.menu_bar(ui));
+            egui::Panel::top(self.wid("options")).frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(8, 3))).exact_size(36.0).show(ui, |ui| self.options_bar(ui));
+            egui::Panel::bottom(self.wid("status")).frame(bar(t.chrome)).exact_size(26.0).show(ui, |ui| self.status_bar(ui));
+            egui::Panel::left(self.wid("tools")).frame(bar(t.chrome).inner_margin(egui::Margin::symmetric(4, 2))).exact_size(if self.two_cols { 72.0 } else { 42.0 }).resizable(false).show(ui, |ui| self.tool_column(ui));
+            egui::Panel::right(self.wid("dock"))
                 .frame(egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(4, 0)))
                 .default_size(250.0)
                 .size_range(200.0..=380.0)
@@ -2651,6 +3163,7 @@ impl eframe::App for App {
         self.agent_poll(&ctx);
         self.dialogs(&ctx);
         self.sign_dialogs(&ctx);
+        self.cross_window_drag(&ctx, shared);
 
         self.debug_screenshot(&ctx);
 
@@ -2836,7 +3349,8 @@ impl App {
             if let Some(buf) = image::RgbaImage::from_raw(w as u32, h as u32, bytes) {
                 let _ = buf.save(&path);
             }
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            self.doc.dirty = false;
+            self.quit = true;
         }
     }
 }
@@ -2864,6 +3378,40 @@ fn stroke_controls(ui: &mut Ui, color: &mut Color32, width: &mut f32) -> bool {
     option_label(ui, "Width:");
     c |= ui.add(egui::DragValue::new(width).range(0.0..=60.0).speed(0.1).suffix(" pt").max_decimals(1)).changed();
     c
+}
+
+/// The grid cell boundary nearest to `p`: the index a dragged page would be inserted before.
+fn grid_slot(p: Pos2, area: Rect, left: f32, cols: usize, cell: Vec2, n: usize) -> usize {
+    let col = ((p.x - area.min.x - left) / cell.x).clamp(0.0, cols as f32 - 0.01);
+    let row = ((p.y - area.min.y - 12.0) / cell.y).max(0.0) as usize;
+    let after = col.fract() > 0.5;
+    (row * cols + col as usize + after as usize).min(n)
+}
+
+/// Accent bar at a grid insertion point.
+#[allow(clippy::too_many_arguments)]
+fn paint_grid_marker(painter: &egui::Painter, to: usize, area: Rect, left: f32, cols: usize, cell: Vec2, n: usize, color: Color32) {
+    if n == 0 {
+        return;
+    }
+    let cell_rect = |i: usize| Rect::from_min_size(area.min + vec2(left + (i % cols) as f32 * cell.x, 12.0 + (i / cols) as f32 * cell.y), cell);
+    let (r, x) = if to < n { (cell_rect(to), 0.0) } else { (cell_rect(n - 1), cell.x) };
+    let x = r.left() + x;
+    painter.line_segment([pos2(x, r.top() + 8.0), pos2(x, r.bottom() - 28.0)], Stroke::new(3.0, color));
+}
+
+/// Accent bar above the thumbnail row a dragged page would be inserted before (or below the
+/// last row).
+fn paint_insert_marker(ui: &Ui, rows: &[(usize, Rect)], area: Rect, to: usize, color: Color32) {
+    let y = match rows.iter().find(|(i, _)| *i == to) {
+        Some((_, r)) => r.top() + 1.0,
+        None => match rows.last() {
+            Some((_, r)) => r.bottom() - 1.0,
+            None => return,
+        },
+    };
+    let painter = ui.painter_at(area);
+    painter.line_segment([pos2(area.left() + 8.0, y), pos2(area.right() - 8.0, y)], Stroke::new(3.0, color));
 }
 
 /// Render scales snap to quarter octaves so small zoom changes reuse the texture.

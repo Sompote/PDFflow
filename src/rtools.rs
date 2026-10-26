@@ -30,6 +30,7 @@ impl Tool {
     }
 }
 
+#[derive(Clone)]
 pub(super) struct RasterOpts {
     /// Brush diameter in picture pixels.
     pub size: f32,
