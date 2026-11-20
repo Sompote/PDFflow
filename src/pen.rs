@@ -354,7 +354,7 @@ impl App {
         let Some(at) = self.flyout else { return };
         let t = Tokens::get(ctx);
         let mut pick = None;
-        let area = egui::Area::new(Id::new("pen-flyout")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
+        let area = egui::Area::new(self.wid("pen-flyout")).order(egui::Order::Foreground).fixed_pos(at).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).show(ui, |ui| {
                 ui.set_width(250.0);
                 ui.spacing_mut().item_spacing.y = 0.0;

@@ -1,0 +1,11 @@
+[package]
+name = "th-hive"
+version = "0.1.8"
+edition = "2021"
+license = "MIT"
+description = "TellusHive's agent harness (vendored from github.com/Sompote/TellusHive, MIT): plugin context, session log, turn/step agent loop, tool pipeline, subagents, compaction"
+
+[dependencies]
+th-llm = { path = "../th-llm" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"

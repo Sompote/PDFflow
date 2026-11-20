@@ -270,13 +270,15 @@ pub struct Doc {
     pub dirty: bool,
     undo: Vec<Vec<PageEntry>>,
     redo: Vec<Vec<PageEntry>>,
+    /// How many undo steps were ever recorded, so a batch of changes can find its own.
+    pushes: u64,
 }
 
 const UNDO_LIMIT: usize = 60;
 
 impl Doc {
     pub fn new_blank() -> Self {
-        Doc { path: None, source: None, pages: vec![PageEntry::blank(A4)], source_pages: 0, source_notes: Vec::new(), dirty: false, undo: Vec::new(), redo: Vec::new() }
+        Doc { path: None, source: None, pages: vec![PageEntry::blank(A4)], source_pages: 0, source_notes: Vec::new(), dirty: false, undo: Vec::new(), redo: Vec::new(), pushes: 0 }
     }
 
     pub fn from_pdf(path: Option<PathBuf>, bytes: Arc<Vec<u8>>, sizes: &[Vec2]) -> Self {
@@ -285,14 +287,14 @@ impl Doc {
             .enumerate()
             .map(|(i, s)| PageEntry { src: PageSrc::Original(i), size: *s, rotation: 0, objects: Vec::new() })
             .collect();
-        Doc { path, source: Some(bytes), pages, source_pages: sizes.len(), source_notes: vec![Vec::new(); sizes.len()], dirty: false, undo: Vec::new(), redo: Vec::new() }
+        Doc { path, source: Some(bytes), pages, source_pages: sizes.len(), source_notes: vec![Vec::new(); sizes.len()], dirty: false, undo: Vec::new(), redo: Vec::new(), pushes: 0 }
     }
 
     /// A copy holding only the pages `idx` (in that order) over the same source, for exporting
     /// or rendering part of the document.
     pub fn subset(&self, idx: &[usize]) -> Doc {
         let pages = idx.iter().filter_map(|i| self.pages.get(*i).cloned()).collect();
-        Doc { path: None, source: self.source.clone(), pages, source_pages: self.source_pages, source_notes: Vec::new(), dirty: false, undo: Vec::new(), redo: Vec::new() }
+        Doc { path: None, source: self.source.clone(), pages, source_pages: self.source_pages, source_notes: Vec::new(), dirty: false, undo: Vec::new(), redo: Vec::new(), pushes: 0 }
     }
 
     pub fn title(&self) -> String {
@@ -328,6 +330,36 @@ impl Doc {
         }
         self.redo.clear();
         self.dirty = true;
+        self.pushes += 1;
+    }
+
+    /// A mark to fold the undo steps recorded after it into one (`squash`) or to take them
+    /// back (`rollback`).
+    pub fn mark(&self) -> u64 {
+        self.pushes
+    }
+
+    fn drop_since(&mut self, mark: u64) -> bool {
+        let added = self.pushes.saturating_sub(mark) as usize;
+        let n = added.min(self.undo.len());
+        self.undo.truncate(self.undo.len() - n);
+        added > 0
+    }
+
+    /// Fold every undo step recorded since `mark` into one, back to `before` (the pages at
+    /// the mark).
+    pub fn squash(&mut self, mark: u64, before: Vec<PageEntry>) {
+        if self.drop_since(mark) {
+            self.push_undo(before);
+        }
+    }
+
+    /// Take back every change made since `mark`, as if it never happened.
+    pub fn rollback(&mut self, mark: u64, before: Vec<PageEntry>, dirty: bool) {
+        if self.drop_since(mark) {
+            self.pages = before;
+            self.dirty = dirty;
+        }
     }
 
     pub fn can_undo(&self) -> bool {

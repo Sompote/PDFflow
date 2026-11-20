@@ -237,22 +237,215 @@ fn describe(i: usize, o: &Obj) -> Value {
 }
 
 impl App {
-    /// Run the tool calls agents sent since the last frame.
+    /// Run the tool calls agents sent since the last frame (the first window holds the server
+    /// and passes each call on to the document it names).
     pub(super) fn agent_poll(&mut self, ctx: &egui::Context) {
-        let Some(server) = &self.agent else { return };
-        let calls: Vec<Call> = server.rx.try_iter().collect();
-        for c in calls {
-            // Errors are returned to the agent instead of popping up in the window.
-            let shown = self.error.take();
-            let mut result = self.agent_call(ctx, &c.name, &c.args);
-            if let Some(e) = self.error.take() {
-                result = Err(e);
+        if self.chat_rx.is_none() && self.agent.is_none() {
+            return;
+        }
+        // The document whose Assistant started a message becomes the agents' default, so
+        // Claude Code and Codex (which call over MCP) work on it.
+        if std::mem::take(&mut self.want_agent_doc) {
+            self.agent_doc = Some(self.doc_id);
+        }
+        for w in &mut self.others {
+            if std::mem::take(&mut w.want_agent_doc) {
+                self.agent_doc = Some(w.doc_id);
             }
-            self.error = shown;
+        }
+        let mut calls: Vec<Call> = self.chat_rx.as_ref().map(|r| r.try_iter().collect()).unwrap_or_default();
+        if let Some(server) = &self.agent {
+            calls.extend(server.rx.try_iter());
+        }
+        for c in calls {
+            let result = self.agent_route(ctx, &c.name, &c.args);
             self.agent_note = Some((c.name.clone(), ctx.input(|i| i.time)));
             let _ = c.reply.send(result);
             ctx.request_repaint();
         }
+    }
+
+    /// What the Assistant is told about this window's document with each message.
+    fn chat_context(&mut self) -> String {
+        let mut s = format!(
+            "[PDFflow document {}: {}{}, {} page{}, page {} on screen, {}",
+            self.doc_id,
+            self.doc.title(),
+            self.doc.path.as_ref().map(|p| format!(" ({})", p.display())).unwrap_or_default(),
+            self.doc.pages.len(),
+            if self.doc.pages.len() == 1 { "" } else { "s" },
+            self.current + 1,
+            if self.doc.dirty { "unsaved changes" } else { "no unsaved changes" }
+        );
+        if let Some((p, i)) = self.sel.filter(|(p, i)| self.doc.pages.get(*p).is_some_and(|pg| *i < pg.objects.len())) {
+            s.push_str(&format!("; selected: object {i} on page {} ({})", p + 1, kind_name(&self.doc.pages[p].objects[i])));
+        }
+        let page = self.text_sel.as_ref().map(|t| t.page + 1);
+        if let (Some(text), Some(page)) = (self.selected_text().filter(|t| !t.trim().is_empty()), page) {
+            s.push_str(&format!("; selected text on page {page}: \"{}\"", th_hive::clip(text.trim(), 600)));
+        }
+        s.push_str(". Tools work on this document unless you pass another 'document'.]");
+        s
+    }
+
+    /// Runs the Assistant's tool calls in the editor, through the first window like MCP calls;
+    /// a call that names no document works on this window's.
+    fn chat_editor(&self, ctx: &egui::Context) -> crate::assistant::engine::Editor {
+        let (tx, ctx, id) = (self.chat_tx.clone(), ctx.clone(), self.doc_id);
+        Arc::new(move |name: &str, mut args: Value| {
+            let new_window = args.get("new_window").and_then(Value::as_bool).unwrap_or(false);
+            if name != "list_documents" && !new_window && args.get("document").is_none_or(Value::is_null) {
+                args["document"] = json!(id);
+            }
+            let (reply, answer) = std::sync::mpsc::channel();
+            tx.send(Call { name: name.to_owned(), args, reply }).map_err(|_| "PDFflow is closing.".to_owned())?;
+            ctx.request_repaint();
+            answer.recv_timeout(std::time::Duration::from_secs(120)).map_err(|_| "PDFflow did not answer in time (is a dialog open in the window?).".to_owned())?
+        })
+    }
+
+    /// Tests: show the Assistant with settings in `dir` and a scripted model.
+    #[cfg(test)]
+    pub(crate) fn test_assistant(&mut self, dir: &std::path::Path, adapter: Arc<dyn th_hive::LlmAdapter>) -> &mut crate::assistant::chat::ChatView {
+        let mut c = crate::assistant::chat::ChatView::with_store(crate::assistant::settings::Store::new(dir));
+        c.adapter = Some(adapter);
+        c.set_settings_open(false);
+        self.chat_open = true;
+        self.chat.insert(Box::new(c))
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chat_view(&self) -> Option<&crate::assistant::chat::ChatView> {
+        self.chat.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chat_area(&self) -> Option<Rect> {
+        self.chat_rect
+    }
+
+    #[cfg(test)]
+    pub(crate) fn chat_entries(&self) -> Vec<crate::assistant::transcript::Entry> {
+        self.chat.as_ref().map(|c| c.entries().to_vec()).unwrap_or_default()
+    }
+
+    /// The Assistant panel.
+    pub(super) fn assistant_ui(&mut self, ui: &mut Ui) {
+        let host = crate::assistant::chat::Host { document: self.chat_context(), editor: self.chat_editor(ui.ctx()), mcp_addr: self.mcp_addr.clone() };
+        let area = ui.max_rect();
+        self.chat_rect = Some(area);
+        let chat = self.chat.get_or_insert_with(|| Box::new(crate::assistant::chat::ChatView::new()));
+        let fx = chat.ui(ui, &host);
+        // Files dragged over the panel: show that a drop attaches them.
+        let (hovering, pointer) = ui.input(|i| (!i.raw.hovered_files.is_empty(), i.pointer.latest_pos()));
+        if hovering && pointer.is_some_and(|p| area.contains(p)) {
+            let t = Tokens::get(ui.ctx());
+            let painter = ui.ctx().layer_painter(egui::LayerId::new(egui::Order::Foreground, self.wid("chat-drop")));
+            painter.rect_filled(area, 6.0, t.accent.gamma_multiply(0.12));
+            painter.rect_stroke(area.shrink(2.0), 6.0, Stroke::new(2.0, t.accent), StrokeKind::Inside);
+            painter.text(area.center(), egui::Align2::CENTER_CENTER, "Drop to attach to the chat", egui::FontId::proportional(15.0), t.text);
+        }
+        if fx.started {
+            self.end_edit();
+            self.chat_mark = Some((self.doc.mark(), self.doc.pages.clone(), self.doc_epoch));
+            self.want_agent_doc = true;
+        }
+        if fx.finished {
+            // The message's edits become one undo step (unless another document was opened).
+            if let Some((mark, before, epoch)) = self.chat_mark.take() {
+                if epoch == self.doc_epoch {
+                    self.doc.squash(mark, before);
+                }
+            }
+        }
+    }
+
+    /// The window holding document `id`.
+    fn window_of(&mut self, id: u64) -> Option<&mut App> {
+        if self.doc_id == id { Some(self) } else { self.others.iter_mut().find(|w| w.doc_id == id) }
+    }
+
+    fn documents(&self) -> Value {
+        let default = self.agent_target_id();
+        let docs: Vec<Value> = std::iter::once(&*self)
+            .chain(self.others.iter())
+            .map(|w| {
+                json!({
+                    "document": w.doc_id,
+                    "file": w.doc.path.as_ref().map(|p| p.display().to_string()),
+                    "title": w.doc.title(),
+                    "page_count": w.doc.pages.len(),
+                    "unsaved_changes": w.doc.dirty,
+                    "agent_default": w.doc_id == default,
+                })
+            })
+            .collect();
+        json!({"documents": docs})
+    }
+
+    /// The document a call without `document` works on: the one used last, while it is open.
+    fn agent_target_id(&self) -> u64 {
+        self.agent_doc.filter(|id| *id == self.doc_id || self.others.iter().any(|w| w.doc_id == *id)).unwrap_or(self.doc_id)
+    }
+
+    /// Run one tool call for an agent: on the document it names (or the default one), in a new
+    /// window for `new_window`, with errors returned instead of shown in the window.
+    pub(crate) fn agent_route(&mut self, ctx: &egui::Context, name: &str, args: &Value) -> R {
+        let a = Args(args);
+        if name == "list_documents" {
+            return Ok(self.documents());
+        }
+        if matches!(name, "open_pdf" | "new_document") && a.bool("new_window") {
+            if a.get("document").is_some() {
+                return Err("Give either 'document' or new_window, not both.".into());
+            }
+            let next = self.others.iter().map(|w| w.win).max().unwrap_or(self.win).max(self.win) + 1;
+            let mut w = self.child(ctx, next, None);
+            let mut args = args.clone();
+            if let Some(o) = args.as_object_mut() {
+                o.remove("new_window");
+            }
+            let v = w.agent_run(ctx, name, &args)?;
+            self.agent_doc = Some(w.doc_id);
+            self.others.push(w);
+            return Ok(v);
+        }
+        let id = match a.get("document") {
+            Some(v) => v.as_u64().ok_or("'document' must be a document id from list_documents.")?,
+            None => self.agent_target_id(),
+        };
+        let count = 1 + self.others.len();
+        let w = self.window_of(id).ok_or_else(|| format!("There is no open document {id}; list_documents shows the {count} open."))?;
+        if name == "close_document" {
+            if count == 1 {
+                return Err("This is the only window, so it cannot be closed; open_pdf or new_document replace its document.".into());
+            }
+            if w.doc.dirty && !a.bool("discard_changes") {
+                return Err("The document has unsaved changes. Save it first (save_pdf) or pass discard_changes: true.".into());
+            }
+            // The window closes in the next frame, as if its close button were pressed.
+            w.allow_close = true;
+            let title = w.doc.title();
+            if self.agent_doc == Some(id) {
+                self.agent_doc = None;
+            }
+            return Ok(json!({"closed": id, "title": title}));
+        }
+        let r = w.agent_run(ctx, name, args);
+        self.agent_doc = Some(id);
+        r
+    }
+
+    /// Run a tool on this window's document; an error the editor would show in a dialog is
+    /// returned to the agent instead.
+    fn agent_run(&mut self, ctx: &egui::Context, name: &str, args: &Value) -> R {
+        let shown = self.error.take();
+        let mut result = self.agent_call(ctx, name, args);
+        if let Some(e) = self.error.take() {
+            result = Err(e);
+        }
+        self.error = shown;
+        result
     }
 
     /// The agent indicator in the status bar: lit while tools are being called.
@@ -261,13 +454,17 @@ impl App {
         let Some(server) = &self.agent else { return };
         let now = ui.input(|i| i.time);
         let recent = self.agent_note.as_ref().filter(|(_, at)| now - at < 2.5);
-        let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::hover());
+        let (r, resp) = ui.allocate_exact_size(vec2(18.0, 18.0), Sense::click());
         icons::paint(ui.painter(), r.shrink(1.0), "bot", if recent.is_some() { t.accent } else { t.text_faint });
         let tip = format!(
-            "AI agents can drive PDFflow over MCP:\n  http://{}/mcp\nor run `pdfflow --mcp` as a stdio server.{}",
+            "AI agents can drive PDFflow over MCP:\n  http://{}/mcp\nor run `pdfflow --mcp` as a stdio server.\nClick to copy the command that connects Claude Code.{}",
             server.addr,
             self.agent_note.as_ref().map(|(n, _)| format!("\nLast tool: {n}")).unwrap_or_default()
         );
+        if resp.clicked() {
+            ui.ctx().copy_text(crate::mcp::claude_code_command());
+            self.status = "Copied the Claude Code command; paste it in a terminal to connect PDFflow.".into();
+        }
         resp.on_hover_text(tip);
         if recent.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
@@ -326,6 +523,7 @@ impl App {
             })
             .collect();
         json!({
+            "document": self.doc_id,
             "file": self.doc.path.as_ref().map(|p| p.display().to_string()),
             "title": self.doc.title(),
             "page_count": self.doc.pages.len(),
@@ -604,6 +802,21 @@ impl App {
                 if added.is_empty() {
                     return Err("There is no text there to mark.".into());
                 }
+                // A review comment at the end of each marked passage.
+                let mut notes = 0;
+                if let Some(text) = a.opt_str("comment").filter(|t| !t.trim().is_empty()) {
+                    let author = a.opt_str("author").map(str::to_owned).unwrap_or_else(|| self.author.clone());
+                    for (p, g) in &targets {
+                        let Some(t) = self.page_text(*p) else { continue };
+                        let Some((r, ..)) = t.runs(g).last().copied() else { continue };
+                        let size = self.doc.pages[*p].size;
+                        let min = pos2((r.max.x + 2.0).clamp(0.0, size.x - NOTE_SIZE), (r.min.y - 4.0).clamp(0.0, size.y - NOTE_SIZE));
+                        let o = Obj { rect: Rect::from_min_size(min, vec2(NOTE_SIZE, NOTE_SIZE)), kind: Kind::Note { text: text.to_owned(), author: author.clone(), date: notes::now_pdf_date(), color: self.note_color } };
+                        added.push((*p, o));
+                        notes += 1;
+                    }
+                }
+                self.close_note();
                 self.doc.checkpoint();
                 let mut pages = Vec::new();
                 for (p, o) in added.iter().cloned() {
@@ -613,7 +826,7 @@ impl App {
                     }
                 }
                 self.focus(added[0].0);
-                Ok(json!({"marked": targets.len(), "objects_added": added.len(), "pages": pages}))
+                Ok(json!({"marked": targets.len(), "objects_added": added.len() - notes, "comments_added": notes, "pages": pages}))
             }
             // ------------------------------------------------------------ snapshot, clipboard
             "snapshot" => {
@@ -1059,6 +1272,184 @@ impl App {
                 self.open_path(path.clone());
                 self.status = format!("Signed by {signer} and saved to {}.", path.display());
                 Ok(json!({"signed_by": signer, "saved": path.display().to_string(), "signatures": self.sig_reports.len()}))
+            }
+            "list_documents" | "close_document" => Err("This tool is answered by PDFflow's first window.".into()),
+            "get_outline" => {
+                let Some(src) = self.doc.source.clone() else { return Ok(json!({"outline": [], "metadata": {}, "note": "A new document has no outline or metadata."})) };
+                let pdf = lopdf::Document::load_mem(&src).map_err(|e| format!("Cannot read the PDF structure: {e}"))?;
+                // Outline pages are source pages; show where they are in the edited document.
+                let page_of = |n: usize| self.doc.pages.iter().position(|p| p.src == PageSrc::Original(n.saturating_sub(1))).map(|i| i + 1);
+                let outline: Vec<Value> = pdf.get_toc().map(|t| t.toc).unwrap_or_default().into_iter().take(3000).map(|e| json!({"level": e.level, "title": e.title, "page": page_of(e.page)})).collect();
+                let mut meta = serde_json::Map::new();
+                if let Ok(info) = pdf.trailer.get(b"Info").and_then(|o| pdf.dereference(o)).and_then(|(_, o)| o.as_dict()) {
+                    for (key, name) in [("Title", "title"), ("Author", "author"), ("Subject", "subject"), ("Keywords", "keywords"), ("Creator", "creator"), ("Producer", "producer"), ("CreationDate", "created"), ("ModDate", "modified")] {
+                        if let Some(v) = info.get(key.as_bytes()).ok().and_then(|o| pdf.dereference(o).ok()).and_then(|(_, o)| lopdf::decode_text_string(o).ok()).filter(|v| !v.trim().is_empty()) {
+                            meta.insert(name.into(), json!(v));
+                        }
+                    }
+                }
+                let mut out = json!({"outline": outline, "metadata": meta});
+                if out["outline"].as_array().is_some_and(Vec::is_empty) {
+                    out["note"] = json!("The document has no bookmarks; get_text and find_text show its headings.");
+                }
+                Ok(out)
+            }
+            "insert_pdf" => {
+                let path = resolve(a.str("path")?, &self.doc);
+                let bytes = Arc::new(std::fs::read(&path).map_err(|e| format!("Cannot read {}: {e}", path.display()))?);
+                let n = lopdf::Document::load_mem(&bytes).map_err(|e| format!("{} is not a readable PDF: {e}", path.display()))?.get_pages().len();
+                let idx: Vec<usize> = match a.get("pages").and_then(Value::as_array) {
+                    Some(list) => list
+                        .iter()
+                        .map(|v| match v.as_i64() {
+                            Some(k) if k >= 1 && k as usize <= n => Ok(k as usize - 1),
+                            _ => Err(format!("{} has pages 1 to {n}; {v} is not one of them.", path.display())),
+                        })
+                        .collect::<Result<_, _>>()?,
+                    None => (0..n).collect(),
+                };
+                if idx.is_empty() {
+                    return Err("No pages to insert.".into());
+                }
+                let len = self.doc.pages.len();
+                let at = match a.opt_int("after") {
+                    Some(k) if k < 0 || k as usize > len => return Err(format!("'after' must be 0 to {len}.")),
+                    Some(k) => k as usize,
+                    None => len,
+                };
+                // The other file's comments come along with its pages.
+                let notes = notes::read_comments(&bytes);
+                let entries = idx.iter().map(|&i| PageEntry { src: PageSrc::Original(i), size: A4, rotation: 0, objects: notes.get(i).cloned().unwrap_or_default() }).collect();
+                self.end_edit();
+                let added = self.import_pages(entries, Some(bytes), at)?;
+                Ok(json!({"inserted": added, "first_page": at + 1, "page_count": self.doc.pages.len()}))
+            }
+            "replace_text" => {
+                let q = a.str("query")?;
+                let new = a.opt_str("replacement").ok_or("'replacement' is required (empty to delete).")?.to_owned();
+                let pages: Vec<usize> = if a.get("page").is_some() { vec![self.page_arg(&a, "page")?] } else { (0..self.doc.pages.len()).collect() };
+                let mut targets: Vec<(usize, Arc<PageText>, Vec<usize>)> = Vec::new();
+                for (p, t) in self.texts(pages.into_iter()) {
+                    for m in t.find(q, a.bool("case_sensitive")) {
+                        targets.push((p, t.clone(), m));
+                    }
+                }
+                let total = targets.len();
+                if let Some(k) = a.opt_int("occurrence") {
+                    let k = k.max(1) as usize;
+                    targets = targets.into_iter().nth(k - 1).into_iter().collect();
+                    if targets.is_empty() {
+                        return Err(format!("'{q}' occurs {total} time(s); there is no occurrence {k}."));
+                    }
+                }
+                if targets.is_empty() {
+                    return Err(format!("'{q}' was not found (find_text shows the text as PDFflow reads it)."));
+                }
+                let color = a.color("color")?.unwrap_or(Color32::BLACK);
+                let cover = a.color("cover_color")?.unwrap_or(Color32::WHITE);
+                let bold = a.bool("bold");
+                let face = crate::text::face(bold);
+                let mut added: Vec<(usize, Obj)> = Vec::new();
+                let mut done = Vec::new();
+                let mut skipped = 0;
+                for (p, t, g) in &targets {
+                    let runs = t.runs(g);
+                    let Some(&(first, origin, end, size0)) = runs.first() else { continue };
+                    // Only horizontal text: a rotated line would need rotated text.
+                    if (end.y - origin.y).abs() > 0.5 + 0.02 * (end.x - origin.x).abs() {
+                        skipped += 1;
+                        continue;
+                    }
+                    for (r, ..) in &runs {
+                        added.push((*p, Obj { rect: r.expand2(vec2(0.6, 0.4)), kind: Kind::Shape { shape: ShapeKind::Rect, stroke: cover, fill: Some(cover), width: 0.0, a: pos2(0.0, 0.0), b: pos2(1.0, 1.0) } }));
+                    }
+                    let size = a.opt_num("size").unwrap_or(size0).clamp(2.0, 300.0);
+                    let mut item = json!({"page": p + 1, "was": t.text_of(g), "box": bx(first)});
+                    if !new.is_empty() {
+                        let top = origin.y - face.ascent / face.upem * size;
+                        let mut o = Obj { rect: Rect::from_min_size(pos2(origin.x, top), vec2(1.0, 1.0)), kind: Kind::Text { text: new.clone(), size, color, bold } };
+                        o.refit_text();
+                        let old_w: f32 = runs.iter().map(|(r, ..)| r.width()).fold(0.0, f32::max);
+                        if o.rect.width() > old_w + 1.0 {
+                            item["overflow_pt"] = json!(r1(o.rect.width() - old_w));
+                        }
+                        added.push((*p, o));
+                    }
+                    done.push(item);
+                }
+                if added.is_empty() {
+                    return Err("The matches are on rotated lines, which replace_text cannot retype; use add_whiteout and add_text.".into());
+                }
+                self.end_edit();
+                self.doc.checkpoint();
+                for (p, o) in added.iter().cloned() {
+                    self.doc.pages[p].objects.push(o);
+                }
+                self.focus(added[0].0);
+                let mut out = json!({"replaced": done.len(), "matches": done, "objects_added": added.len()});
+                if skipped > 0 {
+                    out["skipped_rotated"] = json!(skipped);
+                }
+                Ok(out)
+            }
+            "batch" => {
+                const NOT_IN_BATCH: [&str; 8] = ["open_pdf", "new_document", "close_document", "save_pdf", "sign_pdf", "undo", "redo", "batch"];
+                let calls = a.get("calls").and_then(Value::as_array).ok_or("'calls' (a list of {tool, arguments}) is required.")?.clone();
+                if calls.is_empty() || calls.len() > 500 {
+                    return Err("A batch takes 1 to 500 calls.".into());
+                }
+                // Check every call before running any.
+                for (k, c) in calls.iter().enumerate() {
+                    let tool = c.get("tool").and_then(Value::as_str).ok_or_else(|| format!("Call {} has no 'tool'.", k + 1))?;
+                    if NOT_IN_BATCH.contains(&tool) || tool == "list_documents" {
+                        return Err(format!("Call {} ({tool}) cannot run inside a batch.", k + 1));
+                    }
+                    let args = c.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    if args.get("document").is_some_and(|d| !d.is_null()) {
+                        return Err(format!("Call {} names a document; the calls of a batch work on the batch's document.", k + 1));
+                    }
+                    crate::mcp_tools::check(tool, &args).map_err(|e| format!("Call {}: {e}", k + 1))?;
+                }
+                let atomic = a.opt_bool("atomic").unwrap_or(true);
+                self.end_edit();
+                self.close_note();
+                let (before, mark, dirty) = (self.doc.pages.clone(), self.doc.mark(), self.doc.dirty);
+                let mut results = Vec::new();
+                let mut failed = None;
+                for (k, c) in calls.iter().enumerate() {
+                    let tool = c["tool"].as_str().unwrap_or("");
+                    let args = c.get("arguments").cloned().unwrap_or_else(|| json!({}));
+                    match self.agent_run(ctx, tool, &args) {
+                        Ok(mut v) => {
+                            if let Some(o) = v.as_object_mut() {
+                                o.remove("image_png");
+                            }
+                            results.push(json!({"tool": tool, "result": v}));
+                        }
+                        Err(e) => {
+                            failed = Some(json!({"call": k + 1, "tool": tool, "error": e}));
+                            break;
+                        }
+                    }
+                }
+                match failed {
+                    Some(f) if atomic => {
+                        self.doc.rollback(mark, before, dirty);
+                        self.sel = None;
+                        self.text_sel = None;
+                        self.rlive = None;
+                        self.current = self.current.min(self.doc.pages.len() - 1);
+                        Err(format!("Call {} ({}) failed: {}. The batch was rolled back, so nothing changed.", f["call"], f["tool"].as_str().unwrap_or(""), f["error"].as_str().unwrap_or("")))
+                    }
+                    f => {
+                        self.doc.squash(mark, before);
+                        let mut out = json!({"completed": results.len(), "results": results, "undo_steps": 1});
+                        if let Some(f) = f {
+                            out["failed"] = f;
+                        }
+                        Ok(out)
+                    }
+                }
             }
             _ => Err(format!("Unknown tool '{name}'.")),
         }

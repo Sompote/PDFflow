@@ -172,13 +172,74 @@ fn error(id: Value, code: i64, msg: &str) -> Value {
     json!({"jsonrpc": "2.0", "id": id, "error": {"code": code, "message": msg}})
 }
 
-pub const INSTRUCTIONS: &str = "PDFflow is a PDF editor; these tools work on the document open in its window, live, \
-and every change can be undone there (undo / redo tools). Pages are numbered from 1. Coordinates are PDF points \
-(1/72 inch) on the page as it was opened: origin at the top-left corner, x to the right, y down, so an A4 page is \
-595 x 842. Objects on a page (text, shapes, ink, pictures, comments) are numbered from 0 in drawing order, as \
-list_objects shows them. Typical flow: open_pdf -> document_info / get_text / find_text -> edit (add_text, \
-markup_text, add_shape, add_comment, pages...) -> render_page to look at the result -> save_pdf. Colours are \
-'#rrggbb', '#rrggbbaa' or a name (black, white, red, green, blue, yellow, orange, purple, gray).";
+pub const INSTRUCTIONS: &str = "PDFflow is a PDF editor; these tools work on the documents open in its windows, live, \
+and every change can be undone there (undo / redo tools). The user sees each edit as it happens. \
+Coordinates are PDF points (1/72 inch) on the page as it was opened: origin at the top-left corner, x to the right, \
+y down, so an A4 page is 595 x 842. Pages are numbered from 1; objects added on a page (text, shapes, ink, \
+pictures, comments, markups) are numbered from 0 in drawing order as list_objects shows them, and deleting one \
+renumbers those after it. \
+Documents: each window holds one document; list_documents gives their ids, and every tool takes an optional \
+'document' id (default: the document used last). open_pdf with new_window: true keeps the others open. \
+Reviewing: document_info and get_outline for structure, get_text / find_text to read, render_page to look at a page \
+(scanned pages have no text, so look at them), then markup_text with a 'comment' to mark a passage and say why, \
+or add_comment for a note on its own; list_comments collects the review. \
+Editing: replace_text changes printed words in place, add_text / add_shape / add_image add content, \
+add_whiteout hides content, pages tools reorder, rotate, delete or insert_pdf merges. \
+Use batch for a group of edits so they form one undo step and roll back together on an error. \
+Check your work with render_page before save_pdf; save_pdf without a path overwrites the opened file, so pass a new \
+path unless the user asked to overwrite. Colours are '#rrggbb', '#rrggbbaa' or a name (black, white, red, green, \
+blue, yellow, orange, purple, gray). Unknown or mistyped arguments are refused with the list of valid ones.";
+
+/// Ready-made workflows an MCP client can offer its user.
+fn prompts() -> Value {
+    json!([
+        {"name": "review_pdf", "title": "Review a PDF", "description": "Read a PDF and leave review comments on it in PDFflow.",
+         "arguments": [{"name": "path", "description": "Absolute path of the PDF.", "required": true},
+                       {"name": "focus", "description": "What to check (e.g. technical accuracy, consistency of units, grammar).", "required": false}]},
+        {"name": "edit_pdf", "title": "Edit a PDF", "description": "Make requested changes to a PDF in PDFflow and save a copy.",
+         "arguments": [{"name": "path", "description": "Absolute path of the PDF.", "required": true},
+                       {"name": "instructions", "description": "The changes to make.", "required": true}]}
+    ])
+}
+
+fn prompt(name: &str, args: &Value) -> Result<Value, String> {
+    let arg = |k: &str| args.get(k).and_then(Value::as_str).unwrap_or("").trim().to_owned();
+    let path = arg("path");
+    if path.is_empty() {
+        return Err("'path' is required.".into());
+    }
+    let text = match name {
+        "review_pdf" => {
+            let focus = arg("focus");
+            let focus = if focus.is_empty() { "content, accuracy, consistency and clarity".to_owned() } else { focus };
+            format!(
+                "Review the PDF at {path} in PDFflow, focusing on {focus}.\n\n\
+                 1. open_pdf it with new_window: true, then document_info and get_outline to see its size and structure.\n\
+                 2. Read it with get_text a few pages at a time; render_page any page with figures, tables or no text layer.\n\
+                 3. For each issue, markup_text the exact passage (highlight for a question, strikeout for text to remove, underline for text to fix) \
+                 with a 'comment' that states the problem and the fix. Use add_comment for issues that are not tied to a passage. \
+                 Group the marks of a page in one batch call.\n\
+                 4. list_comments to check the review is complete, then save_pdf to a new file next to the original, named with '-reviewed', \
+                 and give the user a short summary of the main issues by page."
+            )
+        }
+        "edit_pdf" => {
+            let what = arg("instructions");
+            if what.is_empty() {
+                return Err("'instructions' is required.".into());
+            }
+            format!(
+                "Edit the PDF at {path} in PDFflow: {what}\n\n\
+                 1. open_pdf it with new_window: true; find_text or get_text_lines to locate what to change.\n\
+                 2. Make the changes, using replace_text for printed words and batch for related edits so each change is one undo step.\n\
+                 3. render_page every changed page and fix anything that overlaps or overflows.\n\
+                 4. save_pdf to a new file next to the original, named with '-edited', unless the user asked to overwrite it, and report what changed."
+            )
+        }
+        _ => return Err(format!("Unknown prompt '{name}'.")),
+    };
+    Ok(json!({"description": name, "messages": [{"role": "user", "content": {"type": "text", "text": text}}]}))
+}
 
 /// Answer one JSON-RPC message; `None` for notifications. Tool calls go to `call`.
 pub fn handle(msg: &Value, call: &mut dyn FnMut(&str, Value) -> Result<Value, String>) -> Option<Value> {
@@ -195,7 +256,7 @@ pub fn handle(msg: &Value, call: &mut dyn FnMut(&str, Value) -> Result<Value, St
             let version = if PROTOCOLS.contains(&asked) { asked } else { PROTOCOLS[1] };
             json!({
                 "protocolVersion": version,
-                "capabilities": {"tools": {"listChanged": false}},
+                "capabilities": {"tools": {"listChanged": false}, "prompts": {"listChanged": false}},
                 "serverInfo": {"name": "pdfflow", "title": "PDFflow", "version": env!("CARGO_PKG_VERSION")},
                 "instructions": INSTRUCTIONS,
             })
@@ -208,13 +269,23 @@ pub fn handle(msg: &Value, call: &mut dyn FnMut(&str, Value) -> Result<Value, St
                 return Some(error(id, -32602, &format!("Unknown tool: {name}")));
             }
             let args = params.get("arguments").cloned().filter(|a| a.is_object()).unwrap_or_else(|| json!({}));
+            if let Err(e) = crate::mcp_tools::check(name, &args) {
+                return Some(json!({"jsonrpc": "2.0", "id": id, "result": {"content": [{"type": "text", "text": e}], "isError": true}}));
+            }
             match call(name, args) {
                 Ok(v) => tool_result(v),
                 Err(e) => json!({"content": [{"type": "text", "text": e}], "isError": true}),
             }
         }
         "resources/list" => json!({"resources": []}),
-        "prompts/list" => json!({"prompts": []}),
+        "prompts/list" => json!({"prompts": prompts()}),
+        "prompts/get" => {
+            let name = params.get("name").and_then(Value::as_str).unwrap_or("");
+            match prompt(name, params.get("arguments").unwrap_or(&Value::Null)) {
+                Ok(v) => v,
+                Err(e) => return Some(error(id, -32602, &e)),
+            }
+        }
         _ => return Some(error(id, -32601, &format!("Method not found: {method}"))),
     };
     Some(json!({"jsonrpc": "2.0", "id": id, "result": result}))
@@ -241,6 +312,22 @@ fn tool_result(v: Value) -> Value {
 }
 
 // ------------------------------------------------------------------------------- stdio bridge
+
+/// The command that connects Claude Code to this PDFflow.
+pub fn claude_code_command() -> String {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "pdfflow".into());
+    format!("claude mcp add --scope user pdfflow -- \"{exe}\" --mcp")
+}
+
+/// `pdfflow --mcp-config`: how to connect agents to this copy of PDFflow.
+pub fn print_config() -> std::process::ExitCode {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_else(|_| "pdfflow".into());
+    let desktop = json!({"mcpServers": {"pdfflow": {"command": exe, "args": ["--mcp"]}}});
+    println!("Claude Code (stdio, starts PDFflow when needed):\n  {}\n", claude_code_command());
+    println!("Claude Code (HTTP, PDFflow must be running):\n  claude mcp add --scope user --transport http pdfflow http://127.0.0.1:{}/mcp\n", port());
+    println!("Claude Desktop and other stdio clients (mcpServers in their config file):\n{}", serde_json::to_string_pretty(&desktop).unwrap_or_default());
+    std::process::ExitCode::SUCCESS
+}
 
 /// `pdfflow --mcp [--connect host:port]`: MCP over stdio, forwarding tool calls to the editor.
 pub fn bridge(args: &[String]) -> std::process::ExitCode {
@@ -372,19 +459,35 @@ mod tests {
         assert!(handle(&json!({"jsonrpc":"2.0","method":"notifications/initialized"}), &mut call).is_none());
         let list = handle(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}), &mut call).unwrap();
         let tools = list["result"]["tools"].as_array().unwrap();
-        assert!(tools.len() > 40);
+        assert!(tools.len() > 50);
         for t in tools {
             assert_eq!(t["inputSchema"]["type"], "object", "{}", t["name"]);
             assert!(t["description"].as_str().unwrap().len() > 10);
         }
-        let ok = handle(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add_text","arguments":{"page":1}}}), &mut call).unwrap();
+        let ok = handle(&json!({"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"add_text","arguments":{"page":1,"x":1,"y":1,"text":"a"}}}), &mut call).unwrap();
         assert_eq!(ok["result"]["isError"], false);
         assert_eq!(ok["result"]["structuredContent"]["args"]["page"], 1);
         let bad = handle(&json!({"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"undo"}}), &mut call).unwrap();
         assert_eq!(bad["result"]["isError"], true);
         let unknown = handle(&json!({"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"rm_rf"}}), &mut call).unwrap();
         assert_eq!(unknown["error"]["code"], -32602);
+        // A misspelt argument never reaches the editor.
+        let typo = handle(&json!({"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"add_text","arguments":{"page":1,"x":1,"y":1,"txt":"a"}}}), &mut call).unwrap();
+        assert_eq!(typo["result"]["isError"], true);
+        assert!(typo["result"]["content"][0]["text"].as_str().unwrap().contains("no argument 'txt'"));
         assert_eq!(calls, ["add_text", "undo"]);
+    }
+
+    #[test]
+    fn prompts_are_listed_and_filled() {
+        let mut call = |_: &str, _: Value| Ok(json!({}));
+        let list = handle(&json!({"jsonrpc":"2.0","id":1,"method":"prompts/list"}), &mut call).unwrap();
+        assert_eq!(list["result"]["prompts"].as_array().unwrap().len(), 2);
+        let p = handle(&json!({"jsonrpc":"2.0","id":2,"method":"prompts/get","params":{"name":"review_pdf","arguments":{"path":"/tmp/a.pdf","focus":"units"}}}), &mut call).unwrap();
+        let text = p["result"]["messages"][0]["content"]["text"].as_str().unwrap();
+        assert!(text.contains("/tmp/a.pdf") && text.contains("units") && text.contains("markup_text"));
+        let bad = handle(&json!({"jsonrpc":"2.0","id":3,"method":"prompts/get","params":{"name":"edit_pdf","arguments":{"path":"/a.pdf"}}}), &mut call).unwrap();
+        assert_eq!(bad["error"]["code"], -32602);
     }
 
     #[test]

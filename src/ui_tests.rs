@@ -882,3 +882,200 @@ fn importing_a_page_from_another_document() {
     let pdf = lopdf::Document::load_mem(&out).unwrap();
     assert_eq!(pdf.get_pages().len(), 2);
 }
+
+/// The agent-ready tools: documents in several windows, batches that roll back, replacing
+/// printed words, review marks with comments, merging and the outline.
+#[test]
+fn an_agent_reviews_and_edits_across_documents() {
+    use serde_json::json;
+    let src = text_doc("pdfflow-agent2-in.pdf");
+    let mut h = harness(Some(src.clone()));
+    let ctx = h.ctx.clone();
+    let call = |h: &mut Harness<'_, App>, name: &str, args: serde_json::Value| {
+        crate::mcp_tools::check(name, &args)?;
+        let r = h.state_mut().agent_route(&ctx, name, &args);
+        h.run_steps(1);
+        r
+    };
+    let first = h.state().doc_id;
+    // A second document in its own window becomes the default for later calls.
+    let opened = call(&mut h, "open_pdf", json!({"path": src.to_string_lossy(), "new_window": true})).unwrap();
+    let second = opened["document"].as_u64().unwrap();
+    assert_ne!(first, second);
+    let docs = call(&mut h, "list_documents", json!({})).unwrap();
+    assert_eq!(docs["documents"].as_array().unwrap().len(), 2);
+    assert_eq!(docs["documents"][1]["agent_default"], true);
+    // A batch whose last call fails changes nothing.
+    let bad = call(&mut h, "batch", json!({"calls": [
+        {"tool": "add_text", "arguments": {"page": 1, "x": 72, "y": 300, "text": "one"}},
+        {"tool": "delete_page", "arguments": {"page": 9}}
+    ]})).unwrap_err();
+    assert!(bad.contains("rolled back"), "{bad}");
+    let info = call(&mut h, "document_info", json!({})).unwrap();
+    assert_eq!(info["pages"][0]["objects"], 0);
+    assert_eq!(info["unsaved_changes"], false);
+    // A good batch is one undo step.
+    let ok = call(&mut h, "batch", json!({"calls": [
+        {"tool": "add_text", "arguments": {"page": 1, "x": 72, "y": 300, "text": "one"}},
+        {"tool": "add_shape", "arguments": {"page": 1, "shape": "rectangle", "rect": [60, 290, 200, 330]}},
+        {"tool": "markup_text", "arguments": {"style": "highlight", "query": "Soil", "comment": "Define the soil type.", "author": "Reviewer"}}
+    ]})).unwrap();
+    assert_eq!(ok["completed"], 3);
+    let comments = call(&mut h, "list_comments", json!({})).unwrap();
+    assert_eq!(comments["comments"][0]["text"], "Define the soil type.");
+    assert_eq!(comments["comments"][0]["author"], "Reviewer");
+    call(&mut h, "undo", json!({})).unwrap();
+    assert_eq!(call(&mut h, "document_info", json!({})).unwrap()["pages"][0]["objects"], 0);
+    // Replace printed words: a cover and the new text on the same baseline.
+    let rep = call(&mut h, "replace_text", json!({"query": "world", "replacement": "everyone"})).unwrap();
+    assert_eq!(rep["replaced"], 1);
+    assert!(rep["matches"][0]["overflow_pt"].as_f64().unwrap() > 0.0);
+    let objs = call(&mut h, "list_objects", json!({"page": 1})).unwrap();
+    let types: Vec<&str> = objs["objects"].as_array().unwrap().iter().map(|o| o["type"].as_str().unwrap()).collect();
+    assert_eq!(types, ["whiteout", "text"]);
+    let cover = &objs["objects"][0]["box"];
+    let text = &objs["objects"][1]["box"];
+    assert!((cover[0].as_f64().unwrap() - text[0].as_f64().unwrap()).abs() < 1.5, "{cover} {text}");
+    // The first document was not touched; it is reached by its id.
+    assert_eq!(call(&mut h, "document_info", json!({"document": first})).unwrap()["unsaved_changes"], false);
+    // Merge the file into the first document, after its only page.
+    let merged = call(&mut h, "insert_pdf", json!({"document": first, "path": src.to_string_lossy()})).unwrap();
+    assert_eq!((merged["inserted"].as_u64(), merged["page_count"].as_u64()), (Some(1), Some(2)));
+    // Naming a document makes it the default for the calls that follow.
+    assert_eq!(call(&mut h, "find_text", json!({"query": "Soil mechanics"})).unwrap()["count"], 2);
+    assert_eq!(call(&mut h, "find_text", json!({"query": "Soil mechanics", "document": second})).unwrap()["count"], 1);
+    let outline = call(&mut h, "get_outline", json!({})).unwrap();
+    assert!(outline["outline"].as_array().unwrap().is_empty());
+    // Closing: unsaved work is protected, then the window goes.
+    assert!(call(&mut h, "close_document", json!({"document": second})).unwrap_err().contains("unsaved"));
+    call(&mut h, "close_document", json!({"document": second, "discard_changes": true})).unwrap();
+    h.run_steps(3);
+    assert_eq!(call(&mut h, "list_documents", json!({})).unwrap()["documents"].as_array().unwrap().len(), 1);
+    assert!(call(&mut h, "close_document", json!({})).unwrap_err().contains("only window"));
+    assert!(call(&mut h, "add_text", json!({"page": 1, "x": 1, "y": 1, "txt": "typo"})).unwrap_err().contains("no argument"));
+}
+
+/// The Assistant: a message runs the agent on TellusHive's harness, its tools edit the
+/// document in the window, and the whole message is one undo step.
+#[test]
+fn the_assistant_edits_the_document_through_the_chat() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use th_llm::{CallError, Delta, FunctionCall, Message, Provider, Reply, ToolCall, Usage};
+    struct Scripted(AtomicUsize);
+    impl th_hive::LlmAdapter for Scripted {
+        fn id(&self) -> &str {
+            "scripted"
+        }
+        fn serves(&self, _: &Provider) -> bool {
+            true
+        }
+        fn stream(&self, req: &th_hive::LlmRequest, on: &mut dyn FnMut(Delta), _: &AtomicBool) -> Result<Reply, CallError> {
+            let usage = Usage { prompt_tokens: 120, completion_tokens: 12, cached_tokens: 0 };
+            let call = |id: &str, name: &str, args: &str| ToolCall { id: id.into(), kind: "function".into(), function: FunctionCall { name: name.into(), arguments: args.into() } };
+            let mut m = Message::assistant("");
+            match self.0.fetch_add(1, Ordering::SeqCst) {
+                0 => {
+                    // The message carries the document's context.
+                    let last = req.messages.last().map(|m| m.content.as_ref().map(|c| c.text()).unwrap_or_default()).unwrap_or_default();
+                    assert!(last.contains("PDFflow document") && last.contains("pdfflow-chat.pdf"), "{last}");
+                    m.tool_calls = Some(vec![call("c1", "markup_text", r#"{"style":"highlight","query":"Soil","comment":"Name the soil."}"#), call("c2", "add_text", r#"{"page":1,"x":72,"y":300,"text":"Reviewed"}"#)]);
+                    Ok(Reply { message: m, reasoning: None, finish_reason: "tool_calls".into(), usage })
+                }
+                _ => {
+                    on(Delta::Text("Marked **Soil** and added a note.".into()));
+                    Ok(Reply { message: Message::assistant("Marked **Soil** and added a note."), reasoning: None, finish_reason: "stop".into(), usage })
+                }
+            }
+        }
+    }
+    let src = text_doc("pdfflow-chat.pdf");
+    let mut h = harness(Some(src));
+    let dir = std::env::temp_dir().join(format!("pdfflow-chat-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    h.state_mut().test_assistant(&dir, Arc::new(Scripted(AtomicUsize::new(0)))).ask("Review page 1");
+    for _ in 0..400 {
+        h.step();
+        if h.state().doc.pages[0].objects.len() == 3 && h.state().doc.can_undo() {
+            // wait for the end of the message too
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        if h.state().chat_entries().iter().any(|e| matches!(e, crate::assistant::transcript::Entry::Assistant { stats: Some(_), .. })) {
+            break;
+        }
+    }
+    let kinds: Vec<&str> = h.state().doc.pages[0].objects.iter().map(|o| match o.kind {
+        Kind::Ink { highlighter: true, .. } => "highlight",
+        Kind::Note { .. } => "comment",
+        Kind::Text { .. } => "text",
+        _ => "other",
+    }).collect();
+    assert_eq!(kinds, ["highlight", "comment", "text"]);
+    let entries = h.state().chat_entries();
+    assert!(entries.iter().any(|e| matches!(e, crate::assistant::transcript::Entry::Tool { name, result: Some(_), is_error: false, .. } if name == "markup_text")), "{entries:?}");
+    assert!(entries.iter().any(|e| matches!(e, crate::assistant::transcript::Entry::Assistant { text, .. } if text.contains("Marked"))));
+    // One undo takes back the whole message.
+    undo(&mut h);
+    assert!(h.state().doc.pages[0].objects.is_empty());
+    assert!(!h.state().doc.can_undo());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Files dropped on the Assistant panel go with the next chat message (a picture as a picture,
+/// a PDF as its text) instead of onto the page.
+#[test]
+fn files_dropped_on_the_assistant_are_attached() {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use th_llm::{CallError, Delta, Message, Provider, Reply, Usage};
+    #[derive(Debug)]
+    struct Dropped(std::path::PathBuf);
+    impl eframe::egui::DroppedFile for Dropped {
+        fn path(&self) -> &std::path::Path {
+            &self.0
+        }
+        fn bytes(&self) -> Result<Vec<u8>, String> {
+            std::fs::read(&self.0).map_err(|e| e.to_string())
+        }
+    }
+    struct Echo(Arc<AtomicBool>);
+    impl th_hive::LlmAdapter for Echo {
+        fn id(&self) -> &str {
+            "echo"
+        }
+        fn serves(&self, _: &Provider) -> bool {
+            true
+        }
+        fn stream(&self, req: &th_hive::LlmRequest, _: &mut dyn FnMut(Delta), _: &AtomicBool) -> Result<Reply, CallError> {
+            let all: String = req.messages.iter().filter_map(|m| m.content.as_ref().map(|c| c.text())).collect();
+            // The PDF went as its text.
+            self.0.store(all.contains("Soil mechanics") && all.contains("Attached file: pdfflow-drop.pdf"), Ordering::SeqCst);
+            Ok(Reply { message: Message::assistant("Read it."), reasoning: None, finish_reason: "stop".into(), usage: Usage::default() })
+        }
+    }
+    let mut h = harness(None);
+    let dir = std::env::temp_dir().join(format!("pdfflow-chat-drop-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let png = dir.join("scan.png");
+    image::RgbaImage::from_pixel(20, 10, image::Rgba([200, 30, 30, 255])).save(&png).unwrap();
+    let pdf = text_doc("pdfflow-drop.pdf");
+    let saw = Arc::new(AtomicBool::new(false));
+    h.state_mut().test_assistant(&dir, Arc::new(Echo(saw.clone())));
+    h.run_steps(2);
+    let area = h.state().chat_area().expect("the panel is shown");
+    h.hover_at(area.center());
+    h.step();
+    h.input_mut().dropped_files.push(Arc::new(Dropped(png.clone())));
+    h.input_mut().dropped_files.push(Arc::new(Dropped(pdf.clone())));
+    h.run_steps(2);
+    assert_eq!(h.state().chat_view().unwrap().attachments(), [png, pdf]);
+    assert!(h.state().doc.pages[0].objects.is_empty(), "nothing was placed on the page");
+    h.state_mut().chat.as_mut().unwrap().ask("What is in these?");
+    for _ in 0..200 {
+        h.step();
+        if h.state().chat_entries().iter().any(|e| matches!(e, crate::assistant::transcript::Entry::Assistant { text, .. } if text == "Read it.")) {
+            break;
+        }
+    }
+    assert!(saw.load(Ordering::SeqCst), "the model got the PDF's text");
+    let _ = std::fs::remove_dir_all(&dir);
+}

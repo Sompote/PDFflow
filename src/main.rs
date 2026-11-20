@@ -4,6 +4,7 @@
 
 mod adjust;
 mod app;
+mod assistant;
 mod doc;
 mod dsig;
 mod export;
@@ -43,6 +44,9 @@ pub(crate) fn app_icon() -> std::sync::Arc<egui::IconData> {
 fn main() -> std::process::ExitCode {
     // `pdfflow --mcp`: an MCP server on stdin/stdout that drives the editor window.
     let args: Vec<String> = std::env::args().collect();
+    if args.iter().any(|a| a == "--mcp-config") {
+        return mcp::print_config();
+    }
     if args.iter().any(|a| a == "--mcp") {
         return mcp::bridge(&args);
     }

@@ -207,6 +207,9 @@ enum DropZone {
     Grid { area: Rect, left: f32, cols: usize, cell: Vec2, n: usize },
 }
 
+/// Document ids handed to agents, one per window, never reused.
+static NEXT_DOC_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
 pub struct App {
     /// Window number: 0 for the first window, then one more for each window opened.
     win: u64,
@@ -308,6 +311,29 @@ pub struct App {
     /// The MCP server agents drive the editor through, when it could start.
     agent: Option<crate::mcp::Server>,
     agent_note: Option<(String, f64)>,
+    /// This window's document id for agents; it stays with the window (unlike `win`, which
+    /// the first window's successor takes over).
+    pub(crate) doc_id: u64,
+    /// The document agent tools use when a call names none (the first window kept it).
+    agent_doc: Option<u64>,
+    /// Where the MCP server listens (the first window's), for Claude Code and Codex.
+    mcp_addr: Option<String>,
+    /// The Assistant panel (made when first shown) and whether it is shown.
+    pub(crate) chat: Option<Box<crate::assistant::chat::ChatView>>,
+    chat_open: bool,
+    /// Where the Assistant panel is this frame (files dropped on it go to the chat).
+    chat_rect: Option<Rect>,
+    /// Tool calls from the Assistant panels go to the first window, which runs them like MCP
+    /// calls; every window holds a sender, the first window the receiver.
+    chat_tx: std::sync::mpsc::Sender<crate::mcp::Call>,
+    chat_rx: Option<std::sync::mpsc::Receiver<crate::mcp::Call>>,
+    /// The document when the panel's message started (undo mark, pages, epoch), to fold the
+    /// message's edits into one undo step.
+    chat_mark: Option<(u64, Vec<PageEntry>, u64)>,
+    /// Counts documents opened or started in this window.
+    doc_epoch: u64,
+    /// This window's Assistant started a message: its document becomes the agents' default.
+    want_agent_doc: bool,
     /// Full Screen (View menu): the window fills the screen and the chrome collapses to one
     /// bar of tools and tool options above the canvas, so drawing continues as before.
     fullscreen: bool,
@@ -345,6 +371,8 @@ impl App {
         w.trusted = self.trusted.clone();
         w.snap_dpi = self.snap_dpi;
         w.dock_tabs = self.dock_tabs;
+        w.chat_tx = self.chat_tx.clone();
+        w.mcp_addr = self.mcp_addr.clone();
         let size = if self.inner_rect.is_positive() { self.inner_rect.size() } else { vec2(1280.0, 820.0) };
         let at = if self.outer_rect.is_positive() { self.outer_rect.min + vec2(30.0, 30.0) } else { pos2(60.0, 60.0) };
         w.spawn_at = Some((at, size));
@@ -355,7 +383,8 @@ impl App {
     }
 
     fn create(ctx: &egui::Context, win: u64, root: bool) -> Self {
-        App {
+        let (chat_tx, chat_rx) = std::sync::mpsc::channel();
+        let mut app = App {
             win,
             others: Vec::new(),
             closed: false,
@@ -452,9 +481,25 @@ impl App {
             fullscreen: false,
             os_fullscreen: None,
             snap_dpi: 150.0,
-            agent: if cfg!(test) || !root { None } else { crate::mcp::Server::start(ctx.clone()) },
+            agent: None,
             agent_note: None,
+            doc_id: NEXT_DOC_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            agent_doc: None,
+            mcp_addr: None,
+            chat: None,
+            chat_open: false,
+            chat_rect: None,
+            chat_tx,
+            chat_rx: root.then_some(chat_rx),
+            chat_mark: None,
+            doc_epoch: 0,
+            want_agent_doc: false,
+        };
+        if root && !cfg!(test) {
+            app.agent = crate::mcp::Server::start(ctx.clone());
+            app.mcp_addr = app.agent.as_ref().map(|s| s.addr.clone());
         }
+        app
     }
 
     /// An id for a widget of this window, so two windows never share widget state.
@@ -495,6 +540,7 @@ impl App {
     }
 
     fn reset_view(&mut self) {
+        self.doc_epoch += 1;
         self.page_tex.clear();
         self.thumbs.clear();
         self.last_want.clear();
@@ -958,6 +1004,16 @@ impl App {
 
     fn handle_drops(&mut self, ctx: &egui::Context, rects: &[Rect]) {
         let (files, pointer) = ctx.input(|i| (i.raw.dropped_files.clone(), i.pointer.latest_pos()));
+        // Files dropped on the Assistant go with the next chat message.
+        if let (Some(chat), Some(p)) = (self.chat.as_mut(), pointer) {
+            if self.chat_open && self.chat_rect.is_some_and(|r| r.contains(p)) {
+                let paths: Vec<PathBuf> = files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect();
+                if !paths.is_empty() {
+                    chat.attach(paths);
+                    return;
+                }
+            }
+        }
         for f in files {
             let path = f.path().to_path_buf();
             let bytes = match f.bytes() {
@@ -1336,6 +1392,10 @@ impl App {
             ui.menu_button("View", |ui| {
                 if ui.button("Signature Panel…").clicked() {
                     self.sig_panel = true;
+                    ui.close();
+                }
+                if ui.add(egui::Button::selectable(self.chat_open, "Assistant")).clicked() {
+                    self.chat_open = !self.chat_open;
                     ui.close();
                 }
                 if ui.add(egui::Button::selectable(self.grid, "Page Grid").shortcut_text("G")).clicked() {
@@ -1955,8 +2015,11 @@ impl App {
                 let ctx = ui.ctx().clone();
                 self.toggle_fullscreen(&ctx);
             }
+            vline(ui, 16.0);
+            if ui.add(egui::Button::selectable(self.chat_open, egui::RichText::new("Assistant").size(12.0))).on_hover_text("The AI Assistant: review and edit this PDF in a chat (DeepSeek, OpenAI, vLLM, Ollama, OpenRouter, Claude Code, Codex)").clicked() {
+                self.chat_open = !self.chat_open;
+            }
             if self.agent.is_some() {
-                vline(ui, 16.0);
                 self.agent_badge(ui);
             }
             vline(ui, 16.0);
@@ -2055,7 +2118,7 @@ impl App {
             let w = self.content_size().x;
             self.zoom = (rect.width() / w).clamp(0.1, 1.5);
         }
-        let resp = ui.interact(rect, Id::new("canvas"), Sense::click_and_drag());
+        let resp = ui.interact(rect, self.wid("canvas"), Sense::click_and_drag());
         let (pointer, zoom_delta, scroll_delta) = ui.input(|i| (i.pointer.interact_pos().or(i.pointer.hover_pos()), i.zoom_delta(), i.smooth_scroll_delta));
         let old_scroll = self.scroll;
         if resp.contains_pointer() {
@@ -2722,7 +2785,7 @@ impl App {
         let max_scroll = content - rect.height();
         let ty = track.top() + (track.height() - th) * (self.scroll.y / max_scroll);
         let thumb = Rect::from_min_size(pos2(track.left(), ty), vec2(track.width(), th));
-        let resp = ui.interact(track, Id::new("vscroll"), Sense::drag());
+        let resp = ui.interact(track, self.wid("vscroll"), Sense::drag());
         if resp.drag_started() {
             if let Some(p) = resp.interact_pointer_pos() {
                 let grab = if thumb.contains(p) { p.y - thumb.top() } else { th / 2.0 };
@@ -2975,6 +3038,8 @@ impl App {
         // `w` is now the old first window; keep what belongs to the application.
         self.others = std::mem::take(&mut w.others);
         self.agent = w.agent.take();
+        self.agent_doc = w.agent_doc.take();
+        self.chat_rx = w.chat_rx.take();
         self.quitting = w.quitting;
         self.win = w.win;
         self.closed = false;
@@ -3144,6 +3209,14 @@ impl App {
                 .default_size(250.0)
                 .size_range(200.0..=380.0)
                 .show(ui, |ui| self.dock(ui));
+            self.chat_rect = None;
+            if self.chat_open {
+                egui::Panel::right(self.wid("assistant"))
+                    .frame(egui::Frame::NONE.fill(t.dock).inner_margin(egui::Margin::symmetric(12, 10)))
+                    .default_size(380.0)
+                    .size_range(300.0..=680.0)
+                    .show(ui, |ui| self.assistant_ui(ui));
+            }
         }
         egui::CentralPanel::no_frame().show(ui, |ui| {
             self.sig_banner(ui);
@@ -3287,6 +3360,9 @@ impl App {
                 self.set_tool(Tool::Move);
                 self.shot_adjustment(ctx, &k.to_string_lossy());
             }
+        }
+        if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_ASSISTANT").is_some() {
+            self.chat_open = true;
         }
         if self.frames == 5 && std::env::var_os("PDFFLOW_SHOT_SIGNDLG").is_some() {
             if self.ids.is_empty() {

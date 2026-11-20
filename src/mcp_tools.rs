@@ -1,5 +1,6 @@
-//! The tools PDFflow offers over MCP: names, descriptions and input schemas. The editor runs
-//! them (`app/agent.rs`); the stdio bridge only needs this list.
+//! The tools PDFflow offers over MCP: names, descriptions and input schemas, and the check of a
+//! call's arguments against them. The editor runs the tools (`app/agent.rs`); the stdio bridge
+//! only needs this list.
 
 use serde_json::{Map, Value, json};
 
@@ -16,6 +17,8 @@ enum T {
     Pages,
     Strokes,
     Points,
+    /// The calls of a batch: [{tool, arguments}, ...].
+    Calls,
     Enum(&'static [&'static str]),
 }
 
@@ -32,11 +35,16 @@ const COLORS: &str = "Colour: '#rrggbb', '#rrggbbaa' or a name (black, white, re
 
 const TOOLS: &[Tool] = &[
     // ------------------------------------------------------------------------- document
-    Tool { name: "open_pdf", desc: "Open a PDF file in PDFflow (replaces the open document). Returns document_info.", args: &[("path", T::Str, "Absolute path of the PDF (~ is the home folder)."), ("discard_changes", T::Bool, "Open even if the current document has unsaved changes (they are lost).")], required: &["path"] },
-    Tool { name: "new_document", desc: "Start a new document with one blank page.", args: &[("width", T::Num, "Page width in points (default 595, A4)."), ("height", T::Num, "Page height in points (default 842, A4)."), ("discard_changes", T::Bool, "Discard unsaved changes of the current document.")], required: &[] },
+    Tool { name: "list_documents", desc: "Every document open in PDFflow (each window holds one): its id for the 'document' argument, file, page count and unsaved changes. 'agent_default' marks the one tools use when 'document' is omitted.", args: &[], required: &[] },
+    Tool { name: "open_pdf", desc: "Open a PDF file. By default it replaces the document of the target window; new_window: true opens it in a window of its own and keeps the others (compare or copy between documents). Returns document_info, whose 'document' id later calls can pass.", args: &[("path", T::Str, "Absolute path of the PDF (~ is the home folder)."), ("new_window", T::Bool, "Open in a new window instead of replacing the document."), ("discard_changes", T::Bool, "Open even if the current document has unsaved changes (they are lost).")], required: &["path"] },
+    Tool { name: "new_document", desc: "Start a new document with one blank page, in the target window or (new_window: true) in a new one.", args: &[("width", T::Num, "Page width in points (default 595, A4)."), ("height", T::Num, "Page height in points (default 842, A4)."), ("new_window", T::Bool, "Start it in a new window."), ("discard_changes", T::Bool, "Discard unsaved changes of the current document.")], required: &[] },
+    Tool { name: "close_document", desc: "Close a document's window. Refuses when it has unsaved changes unless discard_changes is true, and refuses to close the last window.", args: &[("discard_changes", T::Bool, "Close even with unsaved changes (they are lost).")], required: &[] },
     Tool { name: "save_pdf", desc: "Save the document as a PDF. Without a path it saves over the opened file. Original page content, links and fonts are kept; edits are added on top.", args: &[("path", T::Str, "Where to save (absolute path); required for a new document."), ("remove_signatures", T::Bool, "Allow saving an edited, digitally signed file, which removes its signatures.")], required: &[] },
     Tool { name: "export_pages", desc: "Write some pages (with their edits) to a new PDF file, e.g. to split a document. The open document is not changed.", args: &[("pages", T::Pages, "Page numbers in the order wanted, e.g. [3, 1, 2]."), ("path", T::Str, "Absolute path of the new PDF.")], required: &["pages", "path"] },
-    Tool { name: "document_info", desc: "The open document: file, page count and sizes, current page, unsaved changes, objects per page, digital signatures, undo state.", args: &[], required: &[] },
+    Tool { name: "document_info", desc: "The open document: id, file, page count and sizes, current page, unsaved changes, objects per page, digital signatures, undo state.", args: &[], required: &[] },
+    Tool { name: "get_outline", desc: "The document's bookmarks (outline) with their level and page, and its metadata (title, author, subject, keywords, creator, producer, dates). Use it to see a long document's structure before reading it.", args: &[], required: &[] },
+    Tool { name: "insert_pdf", desc: "Insert pages of another PDF file into this document (merge), with one undo step.", args: &[("path", T::Str, "Absolute path of the PDF to take pages from."), ("pages", T::Pages, "Its page numbers to take, in order (default all)."), ("after", T::Int, "Insert after this page of this document (0 = at the start; default the end).")], required: &["path"] },
+    Tool { name: "batch", desc: "Run several tool calls on one document as a single undo step, e.g. a whole set of review marks or a page rebuild. With atomic (the default) a failing call takes back the calls before it, so the document is never left half edited. Not allowed inside: open_pdf, new_document, close_document, save_pdf, sign_pdf, undo, redo, batch. Pictures are left out of the results.", args: &[("calls", T::Calls, "The calls in order: [{\"tool\": \"add_text\", \"arguments\": {...}}, ...]; their arguments must not name a document."), ("atomic", T::Bool, "Roll back everything when a call fails (default true); false keeps the calls that succeeded and reports the failure.")], required: &["calls"] },
     Tool { name: "undo", desc: "Undo the last change (as Edit › Undo).", args: &[], required: &[] },
     Tool { name: "redo", desc: "Redo the last undone change.", args: &[], required: &[] },
     // ----------------------------------------------------------------------------- view
@@ -50,7 +58,8 @@ const TOOLS: &[Tool] = &[
     Tool { name: "find_text", desc: "Search the PDF's text. Returns each match with its page and boxes. Spaces in the query match line breaks too.", args: &[("query", T::Str, "Text to find."), ("page", T::Int, "Search one page only."), ("case_sensitive", T::Bool, "Match case (default false).")], required: &["query"] },
     Tool { name: "select_text", desc: "Select text in the window (as the Select Text tool does) by search, by area or the whole page, and return it.", args: &[PAGE, ("query", T::Str, "Select this text."), ("occurrence", T::Int, "Which match on the page, from 1 (default 1)."), ("rect", T::Rect, "Select the text inside this area instead."), ("copy", T::Bool, "Also copy it to the clipboard.")], required: &["page"] },
     Tool { name: "copy_text", desc: "Copy text to the system clipboard: the given text, or else the text selected in the window.", args: &[("text", T::Str, "Text to copy.")], required: &[] },
-    Tool { name: "markup_text", desc: "Highlight, underline or strike through text of the PDF. Targets: every match of a query (or one occurrence), the text in an area, or else the current selection. Each line becomes one object.", args: &[("style", T::Enum(&["highlight", "underline", "strikeout"]), "Markup style."), ("query", T::Str, "Text to mark."), ("page", T::Int, "Limit to this page (needed with rect)."), ("occurrence", T::Int, "Only this match (from 1, counted over the searched pages); default all matches."), ("rect", T::Rect, "Mark the text inside this area."), ("color", T::Str, COLORS)], required: &["style"] },
+    Tool { name: "markup_text", desc: "Highlight, underline or strike through text of the PDF, optionally with a review comment beside each marked passage (one undo step). Targets: every match of a query (or one occurrence), the text in an area, or else the current selection. Each line becomes one object.", args: &[("style", T::Enum(&["highlight", "underline", "strikeout"]), "Markup style."), ("query", T::Str, "Text to mark."), ("page", T::Int, "Limit to this page (needed with rect)."), ("occurrence", T::Int, "Only this match (from 1, counted over the searched pages); default all matches."), ("rect", T::Rect, "Mark the text inside this area."), ("color", T::Str, COLORS), ("comment", T::Str, "Also attach this comment (a PDF sticky note) at the end of each marked passage."), ("author", T::Str, "Author of the comment (default the user's name).")], required: &["style"] },
+    Tool { name: "replace_text", desc: "Change words already printed in the PDF: each match is covered (white by default) and the replacement typed over it at the same baseline and font size, in the Sarabun font (one undo step). An empty replacement just removes the text. The result reports a replacement wider than the original ('overflow_pt'), so render_page the area to check the line still reads well.", args: &[("query", T::Str, "Text to replace (as find_text matches it)."), ("replacement", T::Str, "New text; empty to delete."), ("page", T::Int, "Limit to this page."), ("occurrence", T::Int, "Only this match (from 1, counted over the searched pages); default all matches."), ("case_sensitive", T::Bool, "Match case (default false)."), ("size", T::Num, "Font size in points (default the original's)."), ("color", T::Str, "Text colour (default black)."), ("bold", T::Bool, "Bold."), ("cover_color", T::Str, "Colour of the cover under the new text (default white; match a coloured background).")], required: &["query", "replacement"] },
     // ------------------------------------------------------------------ snapshot, clipboard
     Tool { name: "snapshot", desc: "Capture an area of a page (or the whole page), edits included, as a picture: it goes to the system clipboard and PDFflow's clipboard (paste places it), can be saved to a file, and is returned.", args: &[PAGE, ("rect", T::Rect, "Area [x0, y0, x1, y1] in points; default the whole page."), ("dpi", T::Num, "Resolution (default 150)."), ("save_path", T::Str, "Save the picture here (.png or .jpg)."), ("return_image", T::Bool, "Return the picture (default true).")], required: &["page"] },
     Tool { name: "paste", desc: "Paste PDFflow's clipboard (the last snapshot or copied object) onto a page.", args: &[("page", T::Int, "Page (default the current page)."), ("x", T::Num, "Centre x in points."), ("y", T::Num, "Centre y in points.")], required: &[] },
@@ -71,7 +80,7 @@ const TOOLS: &[Tool] = &[
     Tool { name: "add_image", desc: "Place a picture file (PNG, JPEG, GIF, BMP, WebP) on a page.", args: &[PAGE, ("path", T::Str, "Absolute path of the picture."), ("rect", T::Rect, "Box to fill; or give x, y and width."), ("x", T::Num, "Left edge."), ("y", T::Num, "Top edge."), ("width", T::Num, "Width in points (height keeps the proportions).")], required: &["page", "path"] },
     Tool { name: "add_comment", desc: "Add a comment (sticky note); it is saved as a PDF comment that Acrobat and Preview show.", args: &[PAGE, ("x", T::Num, "Left of the note icon."), ("y", T::Num, "Top of the note icon."), ("text", T::Str, "Comment text."), ("author", T::Str, "Author (default the user's name)."), ("color", T::Str, COLORS)], required: &["page", "x", "y", "text"] },
     Tool { name: "place_signature", desc: "Place one of the user's saved drawn signatures on a page.", args: &[PAGE, ("x", T::Num, "Left edge."), ("y", T::Num, "Top edge."), ("width", T::Num, "Width in points (default 150)."), ("signature", T::Int, "Which saved signature, from 0 (default the selected one)."), ("color", T::Str, COLORS)], required: &["page", "x", "y"] },
-    Tool { name: "update_object", desc: "Change an object: move or resize it, or change its text, size, colours or width.", args: &[PAGE, INDEX, ("rect", T::Rect, "New box (not for text, which sizes itself)."), ("x", T::Num, "Move the left edge here."), ("y", T::Num, "Move the top edge here."), ("text", T::Str, "New text (text objects and comments)."), ("size", T::Num, "Font size (text)."), ("bold", T::Bool, "Bold (text)."), ("color", T::Str, "Text, ink or comment colour."), ("stroke_color", T::Str, "Stroke colour (shapes, paths)."), ("fill_color", T::Str, "Fill colour, or 'none'."), ("width", T::Num, "Stroke width.")], required: &["page", "index"] },
+    Tool { name: "update_object", desc: "Change an object: move or resize it, or change its text, size, colours or width.", args: &[PAGE, INDEX, ("rect", T::Rect, "New box (not for text, which sizes itself)."), ("x", T::Num, "Move the left edge here."), ("y", T::Num, "Move the top edge here."), ("text", T::Str, "New text (text objects and comments)."), ("author", T::Str, "Author (comments)."), ("size", T::Num, "Font size (text)."), ("bold", T::Bool, "Bold (text)."), ("color", T::Str, "Text, ink or comment colour."), ("stroke_color", T::Str, "Stroke colour (shapes, paths)."), ("fill_color", T::Str, "Fill colour, or 'none'."), ("width", T::Num, "Stroke width.")], required: &["page", "index"] },
     Tool { name: "delete_object", desc: "Delete an object.", args: &[PAGE, INDEX], required: &["page", "index"] },
     Tool { name: "arrange_object", desc: "Change an object's stacking order.", args: &[PAGE, INDEX, ("to", T::Enum(&["front", "back", "forward", "backward"]), "Where to.")], required: &["page", "index", "to"] },
     Tool { name: "duplicate_object", desc: "Duplicate an object, offset by dx, dy.", args: &[PAGE, INDEX, ("dx", T::Num, "Offset x (default 12)."), ("dy", T::Num, "Offset y (default 12).")], required: &["page", "index"] },
@@ -87,6 +96,14 @@ const TOOLS: &[Tool] = &[
     Tool { name: "sign_pdf", desc: "Digitally sign the document with one of the user's Digital IDs and save the signed copy, which is then opened. Only do this when the user asked to sign and gave the password.", args: &[("digital_id", T::Int, "Which Digital ID, from 0 (list_digital_ids)."), ("password", T::Str, "The Digital ID's password."), ("output_path", T::Str, "Absolute path of the signed PDF."), ("reason", T::Str, "Reason for signing."), ("location", T::Str, "Location."), ("page", T::Int, "Page of a visible signature box."), ("rect", T::Rect, "Visible signature box; omit for an invisible signature.")], required: &["digital_id", "password", "output_path"] },
 ];
 
+/// Arguments every tool except list_documents takes.
+const DOCUMENT: &str = "Which document (an id from list_documents); default the one the agent used last.";
+
+/// Tools that change nothing.
+const READ_ONLY: &[&str] = &["list_documents", "document_info", "get_outline", "render_page", "get_text", "get_text_lines", "find_text", "list_objects", "list_comments", "list_signatures", "list_digital_ids"];
+/// Tools that can lose work or overwrite files.
+const DESTRUCTIVE: &[&str] = &["open_pdf", "new_document", "close_document", "save_pdf", "export_pages", "delete_page", "delete_object", "replace_text", "sign_pdf", "export_picture"];
+
 fn schema(t: &T, desc: &str) -> Value {
     let mut s = match t {
         T::Str => json!({"type": "string"}),
@@ -98,6 +115,7 @@ fn schema(t: &T, desc: &str) -> Value {
         T::Pages => json!({"type": "array", "items": {"type": "integer"}}),
         T::Points => json!({"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}}),
         T::Strokes => json!({"type": "array", "items": {"type": "array", "items": {"type": "array", "items": {"type": "number"}, "minItems": 2, "maxItems": 2}}}),
+        T::Calls => json!({"type": "array", "items": {"type": "object", "properties": {"tool": {"type": "string"}, "arguments": {"type": "object"}}, "required": ["tool"]}}),
         T::Enum(v) => json!({"type": "string", "enum": v}),
     };
     if !desc.is_empty() {
@@ -106,17 +124,24 @@ fn schema(t: &T, desc: &str) -> Value {
     s
 }
 
+fn takes_document(name: &str) -> bool {
+    name != "list_documents"
+}
+
 pub fn list() -> Vec<Value> {
     TOOLS
         .iter()
         .map(|t| {
-            let props: Map<String, Value> = t.args.iter().map(|(n, ty, d)| ((*n).to_owned(), schema(ty, d))).collect();
-            let read_only = matches!(t.name, "document_info" | "render_page" | "get_text" | "get_text_lines" | "find_text" | "list_objects" | "list_comments" | "list_signatures" | "list_digital_ids");
+            let mut props: Map<String, Value> = t.args.iter().map(|(n, ty, d)| ((*n).to_owned(), schema(ty, d))).collect();
+            if takes_document(t.name) {
+                props.insert("document".into(), json!({"type": "integer", "description": DOCUMENT}));
+            }
+            let read_only = READ_ONLY.contains(&t.name);
             json!({
                 "name": t.name,
                 "description": t.desc,
                 "inputSchema": {"type": "object", "properties": props, "required": t.required},
-                "annotations": {"readOnlyHint": read_only, "openWorldHint": false},
+                "annotations": {"readOnlyHint": read_only, "destructiveHint": DESTRUCTIVE.contains(&t.name), "idempotentHint": read_only, "openWorldHint": false},
             })
         })
         .collect()
@@ -124,4 +149,84 @@ pub fn list() -> Vec<Value> {
 
 pub fn exists(name: &str) -> bool {
     TOOLS.iter().any(|t| t.name == name)
+}
+
+/// Check a call's arguments against the tool's schema, so a misspelt or mistyped argument is
+/// reported instead of silently ignored.
+pub fn check(name: &str, args: &Value) -> Result<(), String> {
+    let tool = TOOLS.iter().find(|t| t.name == name).ok_or_else(|| format!("Unknown tool '{name}'."))?;
+    let obj = args.as_object().ok_or("The arguments must be an object.")?;
+    for (k, v) in obj {
+        if v.is_null() {
+            continue;
+        }
+        if k == "document" && takes_document(name) {
+            if !v.is_i64() && !v.is_u64() {
+                return Err("'document' must be a document id (an integer from list_documents).".into());
+            }
+            continue;
+        }
+        let Some((_, ty, _)) = tool.args.iter().find(|(n, _, _)| n == k) else {
+            let mut valid: Vec<&str> = tool.args.iter().map(|(n, _, _)| *n).collect();
+            if takes_document(name) {
+                valid.push("document");
+            }
+            return Err(format!("{name} has no argument '{k}'. Its arguments are: {}.", if valid.is_empty() { "none".to_owned() } else { valid.join(", ") }));
+        };
+        let ok = match ty {
+            T::Str => v.is_string(),
+            T::Num | T::Int => v.is_number(),
+            T::Bool => v.is_boolean(),
+            T::Rect | T::Point | T::Pages | T::Points | T::Strokes | T::Calls => v.is_array(),
+            T::Enum(e) => v.as_str().is_some_and(|s| e.contains(&s)),
+        };
+        if !ok {
+            let want = match ty {
+                T::Str => "text".to_owned(),
+                T::Num => "a number".to_owned(),
+                T::Int => "an integer".to_owned(),
+                T::Bool => "true or false".to_owned(),
+                T::Rect => "[x0, y0, x1, y1]".to_owned(),
+                T::Point => "[x, y]".to_owned(),
+                T::Pages => "a list of page numbers".to_owned(),
+                T::Points => "a list of [x, y] points".to_owned(),
+                T::Strokes => "a list of strokes, each a list of [x, y] points".to_owned(),
+                T::Calls => "a list of {tool, arguments}".to_owned(),
+                T::Enum(e) => format!("one of {}", e.join(", ")),
+            };
+            return Err(format!("{name}: '{k}' must be {want}, not {v}."));
+        }
+    }
+    let missing: Vec<&str> = tool.required.iter().copied().filter(|r| obj.get(*r).is_none_or(Value::is_null)).collect();
+    if !missing.is_empty() {
+        return Err(format!("{name} needs {}.", missing.iter().map(|m| format!("'{m}'")).collect::<Vec<_>>().join(" and ")));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn arguments_are_checked() {
+        assert!(check("add_text", &json!({"page": 1, "x": 1, "y": 2, "text": "a", "document": 3})).is_ok());
+        let e = check("add_text", &json!({"page": 1, "x": 1, "y": 2, "txt": "a"})).unwrap_err();
+        assert!(e.contains("no argument 'txt'") && e.contains("text"), "{e}");
+        assert!(check("add_text", &json!({"page": 1, "x": 1, "y": 2})).unwrap_err().contains("'text'"));
+        assert!(check("add_text", &json!({"page": "one", "x": 1, "y": 2, "text": "a"})).unwrap_err().contains("integer"));
+        assert!(check("markup_text", &json!({"style": "bold"})).unwrap_err().contains("highlight"));
+        assert!(check("list_documents", &json!({"document": 1})).is_err());
+        assert!(check("add_text", &json!({"page": 1, "x": 1, "y": 2, "text": "a", "size": null})).is_ok());
+    }
+
+    #[test]
+    fn hints() {
+        let l = list();
+        let t = |n: &str| l.iter().find(|t| t["name"] == n).unwrap().clone();
+        assert_eq!(t("delete_page")["annotations"]["destructiveHint"], true);
+        assert_eq!(t("get_text")["annotations"]["readOnlyHint"], true);
+        assert!(t("add_text")["inputSchema"]["properties"]["document"].is_object());
+        assert!(t("list_documents")["inputSchema"]["properties"].as_object().unwrap().is_empty());
+    }
 }

@@ -214,6 +214,24 @@ Saving re-reads the untouched source file, rebuilds the page tree in the editor'
 one content stream per edited page, so the original content, links and fonts are kept. Unedited
 JPEGs are embedded unchanged, and edited pictures are embedded with their new pixels and alpha.
 
+## Assistant
+
+View › Assistant (or the Assistant button in the status bar) opens a chat beside the page, ported
+from Aedifex. It runs on TellusHive's agent harness, `th-hive`, a Rust port of the architecture
+of DeepSeek Harness that is vendored in `crates/` with its OpenAI-compatible client `th-llm`. The
+harness supplies the step loop, retry with back-off, compaction of long conversations, a plan
+(`todo_write`), the repeat-tool and continuation guards, optional subagents and a JSONL session
+log. The model is any OpenAI-compatible API (DeepSeek, OpenAI, OpenRouter, Ollama or a vLLM
+server at its own base URL) or a coding agent installed on the computer, Claude Code or Codex,
+which PDFflow starts once per message with its tools over MCP (`pdfflow --mcp --connect`).
+Settings and API keys live in `~/Library/Application Support/PDFflow` (keys in owner-only files),
+and Claude Code and Codex run on the subscription they are logged in with unless that box is
+cleared. The agent uses the same tools as an MCP client, on the document in its window, so every
+edit appears as it is made. The chat shows the streamed reply, the folded reasoning, one row per
+tool call with its arguments, result and time, and the plan, and when a message ends its edits
+become one undo step. Attach pictures or text files to a message; a PDF is opened in PDFflow or
+merged with `insert_pdf` instead.
+
 ## AI agents (MCP)
 
 PDFflow can be driven by AI agents through the
@@ -239,19 +257,35 @@ Claude Desktop and other stdio clients take the same command in their configurat
 { "mcpServers": { "pdfflow": { "command": "/Applications/PDFflow.app/Contents/MacOS/pdfflow", "args": ["--mcp"] } } }
 ```
 
-The 46 tools cover the whole editor. Pages are numbered from 1, objects on a page from 0, and
-positions are PDF points from the page's top-left corner with y pointing down.
+`pdfflow --mcp-config` prints these commands with the path of the copy you run, and a click
+on the robot icon in the status bar copies the Claude Code command.
+
+The 52 tools cover the whole editor. Pages are numbered from 1, objects on a page from 0, and
+positions are PDF points from the page's top-left corner with y pointing down. Each window holds
+one document, so an agent can open a second file with `open_pdf` and `new_window: true`, compare
+the two or merge pages between them, and every tool takes an optional `document` id from
+`list_documents` (without it, a call works on the document the agent used last). The server
+checks each call against the tool's schema before running it, so a misspelt or mistyped argument
+comes back as an error that lists the valid ones instead of being silently ignored.
 
 | Group | Tools |
 |---|---|
-| Document | `open_pdf`, `new_document`, `save_pdf`, `export_pages`, `document_info`, `undo`, `redo` |
+| Documents | `list_documents`, `open_pdf`, `new_document`, `close_document`, `save_pdf`, `export_pages`, `insert_pdf` (merge pages of another file), `document_info`, `get_outline` (bookmarks and metadata), `undo`, `redo`, `batch` |
 | View | `go_to_page`, `set_view`, `set_tool`, `render_page` (a PNG of the page, edits included, so the agent can look at its work) |
-| Text | `get_text`, `get_text_lines` (lines with boxes), `find_text`, `select_text`, `copy_text`, `markup_text` (highlight, underline or strike out every match of a phrase) |
+| Text | `get_text`, `get_text_lines` (lines with boxes), `find_text`, `select_text`, `copy_text`, `markup_text` (highlight, underline or strike out a phrase, with an optional review comment beside it), `replace_text` (change printed words in place) |
 | Snapshot | `snapshot`, `paste`, `copy_object` |
 | Pages | `insert_blank_page`, `duplicate_page`, `rotate_page`, `move_page`, `delete_page` |
 | Objects | `list_objects`, `add_text`, `add_shape`, `add_whiteout`, `add_ink`, `add_path`, `add_image`, `add_comment`, `place_signature`, `update_object`, `delete_object`, `arrange_object`, `duplicate_object`, `select_object` |
 | Pictures | `adjust_picture` (the Image › Adjustments commands), `crop_picture`, `export_picture` |
 | Comments and signatures | `list_comments`, `list_signatures`, `list_digital_ids`, `sign_pdf` |
+
+`batch` runs a list of calls as one undo step, and by default it rolls every call back when one
+fails, so an agent never leaves a page half edited. `replace_text` covers each match and types the
+replacement on the same baseline at the same size in the Sarabun font, and it reports how far a
+longer replacement runs past the original so the agent can check the line with `render_page`. The
+server also offers two prompts, `review_pdf` and `edit_pdf`, which give an MCP client a ready
+workflow: read the document, mark each issue with a comment that states the problem and the fix,
+and save the result next to the original instead of over it.
 
 The server listens on 127.0.0.1 only, and it refuses requests that carry a non-local `Origin`
 header or a body that is not `application/json`, so a web page cannot reach it through the

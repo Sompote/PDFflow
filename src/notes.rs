@@ -185,7 +185,7 @@ impl App {
         let focus = std::mem::take(&mut ed.focus);
         let mut close = false;
         let mut delete = false;
-        let area = egui::Area::new(Id::new("note-popup")).order(egui::Order::Foreground).fixed_pos(if icon.right() + 300.0 > self.view.right() { icon.left_top() - vec2(298.0, 0.0) } else { icon.right_top() + vec2(8.0, 0.0) }).show(ctx, |ui| {
+        let area = egui::Area::new(self.wid("note-popup")).order(egui::Order::Foreground).fixed_pos(if icon.right() + 300.0 > self.view.right() { icon.left_top() - vec2(298.0, 0.0) } else { icon.right_top() + vec2(8.0, 0.0) }).show(ctx, |ui| {
             egui::Frame::popup(ui.style()).fill(t.card).show(ui, |ui| {
                 ui.set_width(270.0);
                 let (bar, _) = ui.allocate_exact_size(vec2(270.0, 4.0), Sense::hover());
