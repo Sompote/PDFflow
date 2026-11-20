@@ -24,12 +24,12 @@ Katsushika Hokusai, c. 1831, public domain.</sub>
 
 ## Download
 
-**Version 0.1.4** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.4)):
+**Version 0.1.5** ([all release files](https://github.com/Sompote/PDFflow/releases/tag/v0.1.5)):
 
 | Platform | File |
 |---|---|
-| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.4-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-macOS-universal.zip) |
-| Windows 10 / 11, 64-bit | [PDFflow-0.1.4-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.4/PDFflow-0.1.4-windows-x64.zip) |
+| macOS 10.15 or later, Apple Silicon and Intel (universal) | [PDFflow-0.1.5-macOS-universal.dmg](https://github.com/Sompote/PDFflow/releases/download/v0.1.5/PDFflow-0.1.5-macOS-universal.dmg) · [.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.5/PDFflow-0.1.5-macOS-universal.zip) |
+| Windows 10 / 11, 64-bit | [PDFflow-0.1.5-windows-x64.zip](https://github.com/Sompote/PDFflow/releases/download/v0.1.5/PDFflow-0.1.5-windows-x64.zip) |
 
 The builds are not signed by Apple or Microsoft, so the first launch needs one extra step. On
 macOS, drag PDFflow to Applications, then right-click it and choose **Open** (or run
@@ -328,7 +328,7 @@ x86_64-apple-darwin x86_64-pc-windows-gnu` and `brew install mingw-w64`).
 
 ## Small and light
 
-The release binary is about 13.6 MB (the digital-signature crypto adds about 1.5 MB and the MCP server about 0.2 MB), and with a 13-page journal paper open at 150 % on a Retina
+The release binary is about 16.6 MB on Intel and 13.6 MB on Apple Silicon (the digital-signature crypto adds about 1.5 MB, the Assistant's agent harness and HTTPS client about 2.5 MB, and the MCP server about 0.2 MB), and with a 13-page journal paper open at 150 % on a Retina
 display the app uses about 95 MB of memory. It runs egui on the glow (OpenGL) renderer with no web
 view and repaints only on input. Page textures are capped at 4096 px per side and 12 MP and are
 kept only for visible pages, and placed pictures keep a preview of at most 1024 px on screen while
